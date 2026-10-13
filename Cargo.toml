@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/model", "crates/indicators", "crates/data", "crates/desktop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+mexc-model = { path = "crates/model" }
+mexc-indicators = { path = "crates/indicators" }
+mexc-data = { path = "crates/data" }
+anyhow = "1"
+arrayvec = "0.7"
+futures-util = "0.3"
+iced = { version = "0.13", features = ["advanced", "canvas", "lazy", "tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+csv = "1"
+prost = "0.14"
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
+zip = { version = "4", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

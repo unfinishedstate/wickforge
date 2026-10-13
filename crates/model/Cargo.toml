@@ -1,0 +1,5 @@
+[package]
+name = "mexc-model"
+version.workspace = true
+edition.workspace = true
+

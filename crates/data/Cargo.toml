@@ -1,0 +1,20 @@
+[package]
+name = "mexc-data"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arrayvec.workspace = true
+futures-util.workspace = true
+mexc-model.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+chrono.workspace = true
+csv.workspace = true
+prost.workspace = true
+rust_decimal.workspace = true
+zip.workspace = true

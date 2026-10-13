@@ -1,0 +1,16 @@
+[package]
+name = "mexc-chart"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mexc-model.workspace = true
+mexc-indicators.workspace = true
+mexc-data.workspace = true
+anyhow.workspace = true
+arrayvec.workspace = true
+iced.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+toml = "0.8"

@@ -1,0 +1,7 @@
+[package]
+name = "mexc-indicators"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mexc-model.workspace = true
