@@ -10,13 +10,17 @@ For native builds, Linux needs its windowing development libraries (the CI workf
 
 ### macOS launcher
 
-From a clone or extracted source directory, run the executable **`run-macos.command`** in the repository root:
+From a **Git clone**, run the executable **`run-macos.command`** in the repository root:
 
 ```sh
 ./run-macos.command
 ```
 
-You can also double-click it in Finder. The launcher finds Rust in `CARGO_HOME` or `~/.cargo/bin` when Finder's PATH does not include it, checks Xcode Command Line Tools, changes to the repository directory, and builds/runs the locked release version. It works when started from another directory and forwards arguments to the app. The first build can take several minutes; subsequent launches reuse Cargo's incremental artifacts. Missing prerequisites produce installation instructions rather than installing tools automatically.
+You can also double-click it in Finder. The launcher finds Rust in `CARGO_HOME` or `~/.cargo/bin` when Finder's PATH does not include it, checks Xcode Command Line Tools, and changes to the repository directory. **Every launch runs `git pull --ff-only` against the checked-out branch's upstream before building/running the locked release version.** A normal clone tracks `main`; the launcher does not switch branches.
+
+Tracked local edits, diverged history, missing upstream configuration, or failed/offline updates stop the launch rather than building stale code. Local edits are never automatically stashed or discarded; updates never create merge commits or rebase. If the pull changes the launcher itself, it restarts the updated script before building. Source ZIP downloads cannot auto-update; use a Git clone for this launcher, or the manual build commands below.
+
+The launcher works when started from another directory and forwards arguments to the app. The first build can take several minutes; subsequent launches reuse Cargo's incremental artifacts. Missing prerequisites produce installation instructions rather than installing tools automatically.
 
 ### Manual build
 
