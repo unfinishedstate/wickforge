@@ -5,6 +5,7 @@ members = ["crates/model", "crates/indicators", "crates/data", "crates/desktop"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 
 [workspace.dependencies]
 mexc-model = { path = "crates/model" }
@@ -20,6 +21,7 @@ serde_json = { version = "1", features = ["arbitrary_precision"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
 csv = "1"
 prost = "0.14"
 rust_decimal = { version = "1", default-features = false, features = ["std"] }

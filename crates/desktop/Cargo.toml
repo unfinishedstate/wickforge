@@ -2,6 +2,7 @@
 name = "mexc-chart"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 mexc-model.workspace = true
@@ -14,3 +15,12 @@ tokio.workspace = true
 futures-util.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 toml = "0.8"
+serde.workspace = true
+serde_json.workspace = true
+rust_decimal.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell"] }

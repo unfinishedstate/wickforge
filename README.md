@@ -1,20 +1,38 @@
 # mexc-chart
 
-A single-process Rust/iced desktop chart for native **Binance, OKX, Coinbase, and MEXC spot and perpetual markets**, quoted in **USD, USDT, or USDC where actually listed**. Includes linear and inverse perpetuals; quote and settlement currencies are distinct. No substituted venue, dated-futures substitute, currency-converted prices, or resampled bars. Starts at MEXC perpetual BTC_USDC / 5m. The desktop calls native exchange providers directly: no localhost server, local REST/WebSocket API, or serialized inter-process market data. Eight indicators are calculated locally, including historical/live CVD; a ninth plots native historical/live open interest. CVD and OI instances can independently use the chart, another native market, or a strict base-asset aggregate. Price-chart drawings are session-only. No API key, account, trading, database, or saved layouts.
+A single-process Rust/iced desktop chart for native **Binance, OKX, Coinbase, and MEXC spot and perpetual markets**, quoted in **USD, USDT, or USDC where actually listed**. Includes linear and inverse perpetuals; quote and settlement currencies are distinct. No substituted venue, dated-futures substitute, currency-converted prices, or resampled bars. A fresh workspace starts at MEXC perpetual BTC_USDC / 5m; subsequent launches restore the saved workspace automatically. The desktop calls native exchange providers directly: no localhost server, local REST/WebSocket API, or serialized inter-process market data. Nine indicators are calculated locally, including historical/live CVD and resettable VWAP; a tenth plots native historical/live open interest. Anchored VWAP is also an ordinary price-chart drawing. TPO and priced-execution Volume Profiles have independent instances, source coverage, and auction/reference levels. CVD and OI instances can independently use the chart, another native market, or a strict base-asset aggregate. Committed workspace configuration, profiles, and drawings are saved locally by default. No API key, account, trading, or database.
 
 ## Run
 
-Requires a current Rust toolchain and a graphical Linux session. Built and exercised on Omarchy/Wayland.
+Requires **Rust 1.89+** and a graphical **Linux, Windows, or macOS** desktop. **Omarchy is optional.** Linux supports the native Wayland/X11 backends; Windows and macOS use iced's native windowing/graphics backends.
+
+For native builds, Linux needs its windowing development libraries (the CI workflow lists Ubuntu packages); Windows needs the Rust MSVC toolchain with Visual Studio C++ Build Tools and the Windows SDK; macOS needs Xcode Command Line Tools.
+
+### macOS launcher
+
+From a clone or extracted source directory, run the executable **`run-macos.command`** in the repository root:
 
 ```sh
-cargo build --release --workspace
+./run-macos.command
 ```
 
-Run the single executable from this directory:
+You can also double-click it in Finder. The launcher finds Rust in `CARGO_HOME` or `~/.cargo/bin` when Finder's PATH does not include it, checks Xcode Command Line Tools, changes to the repository directory, and builds/runs the locked release version. It works when started from another directory and forwards arguments to the app. The first build can take several minutes; subsequent launches reuse Cargo's incremental artifacts. Missing prerequisites produce installation instructions rather than installing tools automatically.
+
+### Manual build
+
+```sh
+cargo build --release --locked --workspace
+```
+
+Run the single executable from this directory on Linux/macOS:
 
 ```sh
 ./target/release/mexc-chart
 ```
+
+On Windows, run `.\target\release\mexc-chart.exe` from PowerShell. `cargo run --release -p mexc-chart` also works on each platform.
+
+`.github/workflows/ci.yml` defines native Linux/Windows/macOS workspace tests, strict Clippy, and optimized builds on stable Rust, with OS/architecture-qualified executable artifacts. Linux also checks the Rust 1.89 minimum separately from current lint rules. Artifacts are executables, not installers or signed/notarized application bundles; normal native runtime/graphics libraries are still required.
 
 Close the window to exit the app and its native feeds/replays. For development, use `cargo run -p mexc-chart`.
 
@@ -24,20 +42,24 @@ On this workstation, `~/Apps/mexc-chart.sh` executes `~/Work/mexc-chart/target/r
 
 | Action | Keyboard | Mouse |
 | --- | --- | --- |
-| Show all shortcuts/actions | F1 anywhere; `?` outside editors | Keys [?] in the compact header |
+| Show all shortcuts/actions | F1 anywhere; `?` outside editors | ? in the compact header |
+| Search and execute contextual commands | Ctrl+K; type, Up/Down/Tab, Enter; Esc cancels | Commands in F1; click a search result |
 | Pan time | Left / Right; Shift for larger steps | Drag chart horizontally; popup pan-time actions |
 | Choose value-scale target | Ctrl+Tab / Ctrl+Shift+Tab cycles price and visible indicator panes | Click a plot/indicator legend or use its scale; active lower legend shows “scale target” |
 | Pan target value scale | Up / Down; Shift for larger steps | Drag the selected plot vertically |
 | Zoom shared time | `=` / `-` | Wheel over any plot; Ctrl-wheel/pixels; wheel/drag any bottom axis |
 | Zoom target value scale | Ctrl+Up / Ctrl+Down; Shift+`=` / Shift+`-` | Shift-wheel over a plot; wheel/drag its right axis |
 | Toggle target auto-fit | F | Popup fit action; double-click any right axis to restore auto-fit |
-| Return to realtime | L / End | Return to realtime appears beside connection status when time following is stopped; popup live action |
+| Return to realtime | L / End | Go live appears beside connection status when time following is stopped; popup live action |
 | Reset time and all value scales, auto-fit, and follow live | R / Home | Popup reset action |
 | Inspect previous / next candle | `[` / `]` (also comma / period) | Hover chart; popup inspection actions |
 | Clear inspection | Escape | Right-click a plotted pane; popup clear-inspection action |
 | Load an older page | B | Popup older-page action |
+| Jump to a UTC date/time | Ctrl+G; enter date/time; Enter | Search “UTC” in Commands; Jump |
 | Retry connection/history/theme now | Y | Popup retry action |
 | Open indicator manager | I | Indicators in the compact header; popup indicator-editor action |
+| Add / manage TPO and Volume Profiles | Indicator chooser: TPO / Visible Range Volume Profile; Ctrl+T / Ctrl+V outside text inputs | Profiles tab, exact-instance Settings / Hide, or Ctrl+K profile commands |
+| Add / reset VWAP | Ctrl+K → Add VWAP; Ctrl+Shift+R in its indicator settings cycles the reset | VWAP in Indicators; typed UTC day/week/month or custom-session selector |
 | Change native market | M | Click the header symbol; popup market-selector action |
 | Change only the native interval | Ctrl+Left / Ctrl+Right outside editors | Header interval dropdown; choices belong to the active exact market, not a cancelled editor draft |
 | Settings / hide / remove active lower indicator | Ctrl+E / Ctrl+H / Ctrl+D outside editors; Ctrl+Tab chooses the target | Settings / Hide / Remove on that indicator's title |
@@ -45,22 +67,40 @@ On this workstation, `~/Apps/mexc-chart.sh` executes `~/Work/mexc-chart/target/r
 | Resize active plot | Ctrl+Alt+Up / Ctrl+Alt+Down, in 32-pixel steps | Drag the grip below that plot |
 | Restore active plot height | Ctrl+Alt+0 | Double-click its grip |
 | Collapse / expand active lower plot | Ctrl+Alt+C | Collapse / Expand on that exact indicator's title |
+| Reorder active lower pane | Ctrl+Alt+Shift+Up / Down | Search “Move active pane” in Commands |
+| Temporarily maximize / restore active plot | Ctrl+Alt+M | Commands; Restore panes in the footer |
 | Scroll lower panes | PageUp / PageDown | Scrollbar or Alt-wheel over plots; axes retain their own gestures |
 | Scroll overlay legends | Shift+PageUp / Shift+PageDown | Legend scrollbar or wheel |
 
-The compact header exposes the native symbol, venue/product/quote, native interval, **Indicators**, **Draw**, and **Keys [?]**, without a large action/navigation bar. Every visible overlay and lower indicator has exact-instance **Details / Settings / Hide / Remove** title controls; the title/body still selects its value-scale target. Compact summaries retain units, inspection/current context, CVD quality/origin, and OI observation provenance/as-of. Contributor identities and verbose source explanations live in Details rather than permanently occupying the chart. Use the manager to restore hidden instances or operate on overlays by keyboard. **F1**, **?** (outside editors), or **Keys [?]** opens the which-key-style popup with chart, drawing, indicator-editor, market-selector, and details bindings, active context first.
+The chart-first header groups the exact native symbol and venue/product/quote on the left, with interval, **Indicators**, **Draw**, and **?** actions on the right. Native OHLC values use grouped monospace readouts with UTC and latest/inspection context; full native volume remains available in its tooltip. Quiet controls and theme-derived surfaces reserve emphasis for selection, focus, and Add/Apply. Every visible indicator retains exact-instance **Details / Settings / Hide / Remove** controls and scale-target selection; compact summaries retain native units, CVD quality/origin, and OI provenance/as-of. **F1**, **?** (outside editors), or the header **?** opens context-first keyboard/mouse help with aligned keycaps and descriptions.
 
 Close is selected initially. **Tab / Shift+Tab** selects actions and wraps; **Enter / Space** activates the selected action or closes the popup. **Up / Down / PageUp / PageDown** scrolls the list; **Escape** closes it. The background widget trees stay mounted: pane/legend/instance-list scroll positions, editor/search drafts, and the workspace layout survive the popup. Input and background dropdown overlays are blocked while live data continues. Closing restores editor focus. Chart actions are disabled in editor-context help; editor-switch actions remain available.
 
-Market, indicator, and detail dialogs adapt to the available window, bounded to 720×680 logical pixels. They leave the full-width chart mounted behind a dimmed, input-blocked backdrop; opening or cancelling a dialog does not change the viewport, manual scales or pane/legend scroll state. Native data continues updating. Headers, validation and action footers stay fixed while content scrolls. Indicator settings use side-by-side instances/parameters when the inner width is at least 600 pixels and stack them at narrower widths.
+Market, indicator, drawing, and detail dialogs adapt to the available window, bounded to 760×720 logical pixels. Drawing palettes and simple indicator editors use shorter content-dependent heights. A single outer shell leaves the full-width chart mounted behind a dimmed, input-blocked backdrop; opening/cancelling does not change numerical scales or source ownership. Headers, validation, and action footers remain fixed while content scrolls with room for its scrollbar. Indicator instances/parameters sit side by side when inner width is at least 600 pixels and stack when narrow; an empty manager gives its full body to parameters rather than reserving an unused list. Drawing anchor A/B cards likewise sit side by side when wide and stack when narrow.
+
+Clicks inside a dialog—including padding, labels, and an already-selected source radio—stay inside that dialog. Close with Escape, its Close/Cancel action, or a press outside the panel; releasing outside after pressing inside does not dismiss it. Dropdowns retain their own selection handling.
 
 The footer groups price connectivity, candle history, indicator attention/quality/freshness, catalog discovery and theme errors into concise clickable summaries. **S** opens Status details; it distinguishes live upstream prices from realtime viewport following and retains raw progress/errors. **Ctrl+J** opens details for the active lower pane, or for the selected manager instance (including overlays and hidden instances). **Escape** closes details; Up/Down/PageUp/PageDown scroll. In indicator details, **Ctrl+E** opens exact-instance settings, **Ctrl+R** retries its selected native sources, and **Ctrl+Shift+C** explicitly switches only that instance to Chart source. In Status details, **Y** retries connection/history/theme.
 
 Wheel gestures are identical over the price and lower plots: bare/Ctrl-wheel zooms shared time; Shift-wheel zooms only that plot's values. Unmodified trackpad pixels pan shared time using the dominant direction, without panning values; Ctrl-pixels zoom time and Shift-pixels zoom values. Alt-wheel over plots scrolls the pane stack. Right/bottom axes always own value/time gestures, including with Alt. On layouts with an unshifted `+`, that also zooms time in. All timestamps are UTC. Prices retain the selected instrument's native quote precision; quantities retain native base-asset or contract units.
 
-Panning or zooming time stops following live without stopping data updates. **Return to realtime** appears beside the connection status while following is stopped; it and **L / End** resume time following without changing manual value bounds or CVD origins. The status still describes upstream connectivity, not whether the viewport follows live. Manual value movement disables auto-fit only for that plot; **R** resets time and every value scale. Navigating to the left edge automatically fetches older candles with keyboard or mouse; prepending history does not shift the viewport.
+The crosshair, drawing hit testing, and resize grips use the same scroll-translated pointer coordinates as the rendered plots. A grip drag remains anchored to its starting height through rapid motion and delayed view updates; keyboard layout changes cancel an older held grip rather than competing with it.
+
+Panning or zooming time stops following live without stopping data updates. **Go live** appears beside connection status while following is stopped; it and **L / End** resume time following without changing manual value bounds or CVD origins. The status describes upstream connectivity, not whether the viewport follows live. Manual value movement disables auto-fit only for that plot; **R** resets time and every value scale. Navigating to the left edge automatically fetches older candles with keyboard or mouse; prepending history does not shift the viewport.
 
 The app initially requests one native page, up to 1,000 candles. Limits differ: Binance and MEXC perpetuals return up to 1,000, MEXC spot 500, OKX recent history 300 and older history 100, and Coinbase up to 300. Short nonempty pages retain an older cursor. Older pages and live updates remain in memory for the selected market; switching clears its candle history. There is no disk cache or hard session-memory cap. The time viewport supports 10–10,000 candles. Connection failures remain visible; connections and failed history requests recover automatically. Reconnection backfills missed candles, including multi-page gaps.
+
+### Fast command and navigation workflows
+
+**Ctrl+K → EMA → Enter** adds a native-default EMA(20) without opening the manager. The palette searches case-insensitively across all entered words and shows exact defaults, shortcuts, indicator IDs/specifications, pane actions, drawing tools, and quick markets. **MACD settings** selects an existing MACD's settings rather than adding another instance; **Open Interest details** opens that exact instance. Up/Down and PageUp/PageDown move through matches, Tab/Shift+Tab wrap, Enter executes, and Escape cancels. In an editor, chart/drawing mutations are omitted. Cancelling preserves the draft and restores the exact previously focused field, including a second or third numeric parameter.
+
+The market selector keeps the **12 most recent successful exact markets** and explicit **favorites**, restored automatically across launches. **Ctrl+F** favorites/unfavorites its selected exchange/product/native-symbol/interval; **Ctrl+Shift+Up/Down** chooses a quick entry. The palette also searches these entries. Every quick switch revalidates the saved full identity against its native catalog; unavailable symbols or intervals stay visible for repair, with no substitution.
+
+**Ctrl+G** accepts `YYYY-MM-DD` (midnight UTC) or `YYYY-MM-DD HH:MM[:SS]`, with optional `T` and trailing `Z`. Invalid dates, offsets, and fractional/leap seconds are rejected without losing the input. A jump centers the time viewport, stops following live, and pages native history chronologically when necessary. Native gaps stay gaps; exhausted/nonadvancing history and future targets are explicitly reported. Manual time navigation, **L / End**, reset, or a market switch cancels pending jump intent without inventing candles or inspection prices.
+
+**Ctrl+Alt+Shift+Up/Down** swaps the active lower pane with its adjacent visible lower pane. **Ctrl+Alt+M** temporarily gives the active plot the chart area; use it again or **Restore panes** to return. Ctrl+Tab still selects a visible target while maximized. Reordering/maximization preserve numerical scales, saved heights/collapse, indicator configurations, histories, and source ownership.
+
+Contributor diagnostics distinguish current discovery, missing input, disconnection, staleness, incomplete native coverage, and configuration repair. Historical proven values never excuse a current blocker. Details name the exact contributor and offer its scoped **Retry contributor**, **Retry discovery**, or settings repair; unrelated healthy producers and the price chart remain intact. **Ctrl+R** in indicator details still explicitly refreshes all that instance's selected sources. Explicit catalog retry evicts only that scope's completed failed cache result, retaining successful and in-flight sharing.
 
 ### UX rollout
 
@@ -69,12 +109,121 @@ The app initially requests one native page, up to 1,000 candles. Limits differ: 
 - **Phase 3 — implemented:** visible source-mode radios, direct exact-native-market radios/checkboxes, an exchange eligibility/selection checklist, and fail-closed All-source revalidation after context or discovery changes.
 - **Phase 4 — implemented:** session-only resizable/collapsible panes, uniform plot gestures, nice value/calendar UTC ticks, compact native quantities with unabridged disclosure, and theme-derived plot contrast.
 - **Phase 5 — implemented:** session instrument drawing books, seven price-chart drawing tools, absolute time/price anchors, transactional gesture history, candle magnet, and adaptive object/property controls.
+- **Phase 6 — implemented:** shared theme-derived UI styling, a single-row chart header, grouped native readouts, quiet contextual actions, numbered responsive drawing tiles, compact selectable lists, grouped properties, aligned keycap help, shorter simple dialogs, and keyboard parameter/source scrolling.
+- **Phase 7 — implemented:** concise market/source rows, theme-colored semantic badges, reduced repeated instructions, full-width empty editors, and deduplicated native OI detail disclosures. F1 retains the complete keyboard flows.
+- **Phase 8 — implemented:** contextual command palette, exact session quick markets, UTC navigation, pane reorder/maximize, repeated drawing creation, contextual styles, actual-native-bar measurement, typed contributor remedies, and explicit synthetic renderer-load measurement.
+- **Phase 9 — implemented:** default-on versioned workspace persistence, native-first revalidation, committed drawing/configuration restore, historical viewport/pane restoration, atomic debounced saves, close flush/retry, and separately confirmed current-chart/global resets.
+- **Phase 10 — implemented:** independent native TPO/Volume Profiles, exact execution quantities, POC/value areas, auction structure and reference lifecycles, custom IANA sessions, keyboard range placement/settings, explicit coverage/provenance, and schema-2 profile persistence/reset support.
+- **Phase 11 — implemented:** native-candle VWAP with UTC/calendar or IANA daily resets, ordinary anchored VWAP drawings, shared incremental volume weighting, explicit origin/partial history, automatic native-origin paging, and schema-4 configuration persistence.
+- **Phase 12 — implemented:** colorful standalone defaults, optional Linux Omarchy integration, portable native workspace paths/locking/atomic writes, platform-aware diagnostics, and native Linux/Windows/macOS build CI.
+
+## Workspace persistence and clean starts
+
+Persistence is **on by default**. Committed changes autosave after roughly 500 ms of inactivity; normal window closure waits for the latest revision. Save failures remain visible through **Workspace attention → Details → Retry workspace save**. Closing after a failure offers Retry (initial keyboard selection) or explicit Exit without saving.
+
+An absolute **`XDG_STATE_HOME`** overrides storage on every platform. Otherwise the checkpoint uses the native per-user location:
+
+| Platform | Workspace checkpoint |
+| --- | --- |
+| Linux | `~/.local/state/mexc-chart/workspace.json` |
+| macOS | `~/Library/Application Support/mexc-chart/workspace.json` |
+| Windows | `%LOCALAPPDATA%\mexc-chart\workspace.json`, with native Known Folder/profile fallback |
+
+Empty/relative overrides never create state relative to the working directory. Unix application directories/files use **0700/0600**; Windows inherits its containing per-user directory's ACLs, including for explicit storage overrides. The desktop owns versioned JSON checkpoints, synchronized same-directory atomic replacements, a last-good `.backup`, and a retained native single-writer `.lock`. A second instance cannot overwrite the first workspace; it shows a persistence-unavailable warning.
+
+Unix replacements synchronize the parent directory; macOS file writes additionally request `F_FULLFSYNC`. Windows uses native write-through replacement without deleting the destination first. Completed Windows reset markers are durably retired before unlinking so an interrupted cleanup cannot replay an obsolete reset over newer saves. Windows cleanup unlinks can leave ignored temporary artifacts after interruption; Reset everything removes them. Filesystems that reject required synchronization report a save failure rather than silently weakening the write.
+
+Restored configuration includes exact market/interval; indicator IDs/order/specs/source membership/visibility; profile IDs/specifications/visibility/fixed native bindings; pane height/collapse/active target/manual scales; time zoom/live-following or historical position; committed drawing books across instruments including hidden/locked objects; favorites/recents; and magnet. Auto-fit bounds are recomputed. Candles, profile outputs, priced executions, numerical outputs, raw source observations, CVD/OI/profile coverage, connections, caches, undo/redo, inspection, dialogs/drafts, temporary maximization, and armed tool/Repeat state are not saved.
+
+The saved native market is catalog-validated before its feeds start. Missing listings/intervals remain explicit for repair, never replaced with default-market prices. Indicators recalculate and native contributors reestablish coverage; old CVD counters or OI values are not restored as live proof. Historical views page ordinary native history toward their saved visible range without inventing missing bars or moving manual bounds.
+
+Search these actions with **Ctrl+K**, or use their **F1** buttons:
+
+| Action | Clears | Preserves |
+| --- | --- | --- |
+| **Clear current chart** | Every indicator, chart-following profiles, fixed profiles bound to the current native instrument, current instrument drawings across all intervals (hidden/locked included), undo/redo, layouts/scales, drafts and interactions; returns to live/auto-fit | Exact current market/interval, other instruments' fixed profiles and drawing books, favorites/recents, magnet |
+| **Reset everything** | All indicators/profiles/books/layouts, favorites/recents, preferences and owned recovery copies; returns to fresh BTC_USDC/5m defaults | Omarchy theme and desktop configuration |
+
+Both require confirmation. Enter initially cancels; Tab/Shift+Tab switches the two choices, Enter activates the selected choice, and Escape cancels. Confirmed resets immediately record an authoritative reset intent, fence older writers/callbacks, and replace both checkpoint and backup before completing. Interrupted reset recovery cannot resurrect removed objects. These resets cannot be undone.
+
+Corrupt checkpoints recover from a validated backup when possible, retaining a warning and the corrupt copy. Unknown newer schema files are preserved read-only: use a newer app, or explicitly **Reset everything**. A partial clear cannot safely interpret and delete only part of an unknown newer workspace. **Schema 4** adds VWAP resets and anchored drawing starts, safely migrating schemas 1/2/3 without losing existing indicators, drawings, profiles or presentation. Missing older profile-estimation settings default to automatic fallback; explicit policies remain intact. Version bumps protect newer checkpoints from readers that cannot represent their configuration. No older session-only files are guessed or migrated. Tests use private temporary storage, and synthetic stress launches bypass workspace storage entirely.
+
+## VWAP
+
+**Ctrl+K → Add VWAP → Enter** adds a normal price overlay, defaulting to **UTC day**. **Indicators → VWAP** exposes independent instances with **UTC day, week, month, or custom IANA daily-session** resets. In its settings, **Ctrl+Shift+R** cycles the reset; custom sessions expose timezone and local open/close fields with Tab-driven focus reveal. Apply edits only the selected instance; New starts another. Normal visibility, removal, Details and workspace restore apply.
+
+- **Calculation:** cumulative `Σ(HLC3 × native candle volume) / Σ(native candle volume)`, where `HLC3 = (high + low + close) / 3`. This is an explicitly labeled **candle approximation**, not execution-price/tick VWAP. It uses the active chart's actual native interval and volume units, not a foreign/aggregate source or invented base conversion; changing interval can change the approximation.
+- **Sessions:** UTC calendar resets and the same IANA/DST window rules described below for profiles. Custom windows run on all calendar days, not a holiday/exchange calendar. Candles crossing session boundaries are excluded rather than split; outside-session points have no value. Zero accumulated volume has no value, not zero price.
+- **History:** the legend/Details expose the true origin and **covered window / Partial** state. Native history pages automatically toward required visible/latest reset origins and anchored starts without moving the camera. Unavailable origins, interior gaps, invalid input and coarse/unaligned boundaries stay partial; they never silently create a new full origin. Gaps/reset origins are not connected by a line, and an isolated value remains visible as a dot. The forming native candle remains provisional.
+
+**Draw → Anchored VWAP**, tool **9**, or the command-palette drawing action starts one-anchor placement. Choose a native candle with the mouse, or use **Left/Right → Enter** (Shift moves ten native candles). The curve has **only a start time**: prices are derived from candle HLC3 and volume. Click the curve to select; drag its start handle, nudge with Left/Right, or use **Ctrl+E → UTC start → Ctrl+Enter** to change the origin. Exact ISO-8601/millisecond starts persist; a typed between-bar start uses the first later native opening and is labeled partial, without prorating a candle.
+
+Anchored VWAP uses ordinary drawing appearance, hide/show, locking, deletion and per-instrument undo/redo—not profile configuration history. It binds to the exact native exchange/product/symbol, survives timeframe changes and returning to that instrument, and restores across launches. Only configuration is saved; native values and coverage are recomputed. Standard and anchored VWAP share the same incremental engine; tail replacements/corrections update the affected suffix, while prepends/reset changes reseed. Neither painting nor crosshair movement calculates the series.
+
+## TPO and Volume Profiles
+
+**Indicators** includes **TPO** and **Visible Range Volume Profile** in its ordinary type chooser. In that editor, Ctrl+T adds TPO; Ctrl+V adds visible VP outside text inputs (parameter paste remains normal). **Draw → Selected Range Volume Profile**, or Ctrl+P in Draw, starts two-anchor fixed placement. **Ctrl+K → Add TPO profile / Add Volume profile / Add Visible Range Volume Profile / Selected Range Volume Profile** exposes the same profile engine. **Configure new … profile**, the Profiles tab, and exact-ID results expose settings, visibility, deletion, and source details. Apply keeps the editor open; Ctrl+N starts another instance. Histograms remain passive, clipped, theme-native graphics and do not change price auto-fit.
+
+### Calculation and source identity
+
+- **TPO:** native **1-minute bar-range TPO**, independent of the displayed candle interval—not tick-by-tick trade reconstruction. A row counts once per block even if many native bars revisit it. Default blocks are 30 minutes. Compact blocks and expanded letters share the same calculation; letters require enough row height/time width to be readable.
+- **Volume:** prefers actual priced native executions/aggregates with native identities and Decimal quantities. **Automatic estimation is enabled by default:** a requested native minute with incomplete execution proof uses its available native 1-minute candle quantity, distributed uniformly across its occupied price rows. It replaces that minute's partial executions, never adds them twice. Fully proven execution intervals retain exact contributions; recovery replaces estimates. Closed partial-minute edges are time-prorated; forming candles already report elapsed quantity, not forecast volume. Invalid/missing candles retain only observed executions and an explicit gap. **Estimated / Mixed** badges, row inspection and quantity disclosure identify approximations. Ctrl+9 in Volume settings toggles fallback; Ctrl+S commits an exact-only choice. Native base/contract units are preserved; neither dollar notional nor native execution coverage is invented.
+- Rows are anchored to a zero-origin grid of **authoritative native tick size × ticks per row**. Automatic row sizing resolves a saved configuration once; zooming or changing the display interval does not silently rebin. Ctrl+R explicitly resolves new rows from the current native price reference. Missing authoritative tick metadata makes the profile unavailable rather than guessing from decimal places.
+- **POC** is the maximum-weight row; ties choose the row nearest the distribution midpoint, then the lower row. The displayed price is its lower-middle native tick. Default **70% value area** expands one adjacent whole row at a time toward greater weight, choosing the lower side on a tie. VAH/VAL include the boundary rows; these are documented conventions, not vendor-exact parity claims.
+
+### Ranges, sessions, and auction structure
+
+Calendar sessions use UTC days/weeks/months. Custom daily sessions use an **IANA timezone**, inclusive local open and exclusive local close, on all calendar days—not an equity-market holiday/weekend calendar. A close before the open runs overnight; equal times mean one full local day. DST uses the earliest ambiguous open and latest ambiguous close; nonexistent local minutes advance to the first valid minute. Collapsed windows are skipped and the latest opening wins overlaps. Details disclose the actual UTC bounds.
+
+Session and visible-range profiles follow the active native instrument. Fixed ranges bind to **exchange/product/native symbol**, excluding the candle interval, and remain dormant on other instruments. Return to their bound instrument before chart-relative rebinning or range placement. Fixed UTC fields preserve milliseconds; TPO requires whole-minute bounds. Visible range means **visible time**, not the manual price scale; TPO uses only complete native minutes inside that time range. Fixed/visible Volume histograms dock on the right of the price plot; TPO stays time-anchored.
+
+- **Developing / completed:** open formations remain provisional. Developing TPO distinguishes covered closed native minutes plus an observed provisional current minute from genuinely missing source history. A closed formation is complete only with proven source coverage.
+- **Previous / naked levels:** certified closed origins only. Previous POC/VAH/VAL and naked POC-row references are session features, including monitoring between custom sessions. A naked POC retires when its row is touched. Origins are limited to loaded, certified native history and the 33-session calculation budget—not an assertion that every older naked level has been discovered.
+- **Single Prints / tails:** one-block interior runs are distinct from terminal auction tails and retain their owner block. Certified interior zones extend forward, including when their origin is offscreen. Touch state distinguishes untouched, partially filled, filled, and unproved; filled zones no longer extend forward. Positive observed touches survive later coverage gaps. Tails stay formation-local.
+- **Initial Balance:** actual native high/low over the first two TPO blocks—one hour at the default block size—not rounded outer bin edges. **Poor highs/lows** identify multi-block occupation of the extreme profile rows; interpretation depends on the chosen row grid.
+
+Inspect a price for its TPO block count or profile quantity, including observed/estimated/mixed provenance. The single-line inspection slot stays stable while profiles are visible; hovering changes content, not chart layout. **Applied profile / provenance** shows bounds, as-of time, coverage/reasons, contributed Decimal quantities, levels, structure, and execution/candle history/live status. Estimated totals include candle approximations and are not exact traded-at-price quantities. A connected price feed or estimated profile never certifies historical execution completeness.
+
+### Native Volume Profile capabilities
+
+| Native scope | Priced source / limitations |
+| --- | --- |
+| Binance Spot, USDⓈ-M, COIN-M | Native aggregates through REST/WebSocket and official daily aggregate archives. Preserve native identity/quantity semantics; market aggregates are not raw individual fills. |
+| OKX Spot / Swap | Native raw trades, `trades-all`, recent history and instrument-specific official UTC+8 archives. Live observations alone are not automatically certified complete. |
+| Coinbase Exchange Spot | Native matches, REST trade-ID pagination/replay and heartbeat proof. Incomplete continuity/retention remains explicit. |
+| Coinbase International | Public unauthenticated priced-execution profiles are unavailable; no substitution with Coinbase spot. |
+| MEXC Perpetual | Native recent deals/live capture; no pageable deep execution history. Default candle fallback can show Estimated/Mixed profiles; exact-only historical sessions usually remain Partial. |
+| MEXC Spot | Native priced tape is exposed with separate REST/protobuf identity namespaces, but authoritative native tick-size metadata is unavailable; profile rows are currently **unavailable**, not guessed. |
+
+Coverage and native API limits are explicit. Binance futures REST retention is short; older requests use official archives where available. Archive publication, listing availability, failed requests, disconnections, and decode/request budgets can leave partial history. Native inputs are memory-only: restarting does not turn an earlier MEXC capture into durable historical proof.
+
+### Profile keyboard controls
+
+| In the profile editor | Action |
+| --- | --- |
+| Ctrl+Left / Right; Ctrl+Up / Down | Cycle type; select the exact existing instance |
+| Alt+Left / Right; Alt+Up / Down | Cycle session/fixed/visible range; cycle UTC/custom session |
+| Ctrl+N / Ctrl+S | New draft / apply selected instance without closing |
+| Tab / Shift+Tab; PageUp / PageDown | Traverse fields with layout-driven focus reveal; scroll content/details |
+| Ctrl+1…8 | Toggle histogram, levels, previous, naked, Single Prints/tails, IB, letters, poor extremes; unavailable options stay disabled |
+| Ctrl+9 (Volume) | Toggle automatic candle fallback; Ctrl+S applies the setting |
+| Ctrl+H / Ctrl+D | Show/hide / remove selected instance |
+| Ctrl+R / Ctrl+Shift+R | Explicit rebin / retry shared native profile history without clearing observed tape |
+| Ctrl+P | Transfer to two-anchor fixed-range placement |
+
+For placement, click two times or use **Left/Right → Enter → Left/Right → Enter**; Shift moves ten displayed native bars. Escape cancels without committing. TPO anchors snap to whole UTC minutes. Profile settings and fixed bindings persist automatically; outputs, native tape, coverage, and uncommitted placement do not.
+
+Fixed-profile range rails are explicit selection/body-drag targets; selected vertical endpoint lines resize the time range. Ordinary drawing hits, active tools and held gestures retain priority; **Space-drag** pans. **Draw → Profile ranges** lists existing fixed profiles; **Ctrl+K → “4 Volume select range”** selects an exact ID without a mouse. Selected profiles support **Ctrl+E** settings, **Ctrl+H** visibility and **Delete** removal; Escape cancels an uncommitted drag. Range edits preserve duration when translated, native binding and chart view. They save as profile configurations, not drawing-book undo/redo objects.
+
+The worker shares source lifetimes per native instrument, independently of candle interval and data kind, including hidden instances. Priced consumers can share an existing CVD execution producer; Binance CVD remains on cheap native kline quantities. Closed fixed ranges without ongoing lifecycle work do not keep unnecessary live profile producers running. Aggregation stays off the GUI thread, uses identity-aware replacement/correction, and preserves inflight bulk history while repairing only the newer tail. Explicit profile limits include 250,000 source minute bars, 2,000,000 executions, 200,000 rows per price span/profile, 1,000,000 cached contribution rows, and 33 session origins. Limits report errors rather than silently changing rows or certifying truncated data.
+
+The contribution budget includes retained fallback-minute entries, including zero-volume minutes, not just occupied price rows. Estimation does not change CVD or OI calculations.
 
 ## Drawings
 
-**Draw** in the header or **Ctrl+Shift+D** opens the tool menu and object list. Drawings belong only to the price plot. Books are keyed by exact **exchange / product / native symbol**, not interval: switching instruments leaves the previous book in memory, returning restores it, and interval changes reproject the same anchors onto native bars. Restarting clears every book and its undo/redo history; nothing is saved to disk.
+**Draw** in the header or **Ctrl+Shift+D** opens the tool menu and object list. Drawings belong only to the price plot. Books are keyed by exact **exchange / product / native symbol**, not interval: switching instruments retains the previous book, returning restores it, and interval changes reproject the same anchors onto native bars. All committed books restore across launches, including hidden/locked objects and semantic styles. Selection, unfinished edits, and undo/redo history start fresh.
 
-Tool keys **0–7**, while Draw is open, choose **Select, horizontal line, vertical line, trend segment, ray, rectangle/zone, Fibonacci retracement, and text** respectively. Creation tools clear the previous selection. Horizontal, vertical, and text tools need one anchor; the others need two. Click anchors, or use arrows to position a keyboard anchor and **Enter** to confirm it. Keyboard placement starts at the inspected/current real candle; Shift makes larger steps. Text opens a focused, validated text editor. Completing creation returns to Select.
+Tool keys **0–9**, while Draw is open, choose **Select, horizontal line, vertical line, trend segment, ray, rectangle/zone, Fibonacci retracement, text, measurement, and anchored VWAP** respectively. Creation tools clear the previous selection. Horizontal, vertical, text, and anchored VWAP tools need one anchor; the others need two. Click anchors, or use arrows to position a keyboard anchor and **Enter** to confirm it. Keyboard placement starts at the inspected/current real candle; Shift makes larger steps. Anchored VWAP snaps time to actual native candles and derives prices. Text opens a focused, validated text editor. Completing creation returns to Select unless **Repeat** is enabled. Repeat defaults off; toggle it with **Ctrl+Shift+R** in Draw or while a price drawing/tool is active. Successful text Apply also rearms a repeated Text tool; Escape or cancelling text disarms it and returns to Select.
 
 Anchors are absolute **UTC milliseconds and native quote prices**, never candle indices or pixels. Free placement supports between-bar and offscreen/future coordinates. Optional **Magnet** snaps near an actual visible candle's OHLC point; it does not invent grid prices or candles. Native precision is retained in drawing labels, including nine-decimal instruments.
 
@@ -90,15 +239,23 @@ Anchors are absolute **UTC milliseconds and native quote prices**, never candle 
 | Apply property/text draft | Ctrl+Enter | Apply |
 | Cancel / deselect | Escape cancels an active gesture/tool, then clears selection; in properties it cancels the draft, then closes Draw | Select / clear; Cancel edit; Close |
 | Traverse / scroll properties | Tab / Shift+Tab; PageUp / PageDown | Fields; content scrollbar |
-| Cycle ink / stroke pattern | Ctrl+Alt+K / Ctrl+Alt+P in properties | Ink / Stroke dropdowns |
+| Cycle ink / stroke pattern | Ctrl+Alt+K / Ctrl+Alt+P for an unlocked selected price drawing or in properties | Contextual Ink / Stroke controls; property dropdowns |
+| Adjust selected drawing line width | Ctrl+Alt+`[` / `]` outside property editing | Contextual minus / plus |
+| Repeat the chosen tool | Ctrl+Shift+R in Draw or with a price drawing/tool active | Repeat checkbox |
 | Reverse Fibonacci / toggle right extension | Ctrl+Alt+R / Ctrl+Alt+E in Fibonacci properties | Reverse / Extend right checkboxes |
-| Temporarily navigate over drawings or with a creation tool active | Hold Space while dragging | Space-drag pans normally; axes retain their own gestures |
+| Temporarily navigate over drawings or with a creation tool active | Hold Space before pressing the mouse button | Space-drag pans normally; an already-started drawing drag keeps ownership |
 
-The object list includes hidden, locked, overlapping, and offscreen drawings. Properties accept exact UTC ISO-8601 values or integer milliseconds, prices, ink, line width/pattern, rectangle fill opacity, text/label size, text, and Fibonacci ratios as appropriate. Locking prevents movement and anchor/text/Fibonacci edits; explicit visibility, appearance, unlock, and deletion remain available. Invalid Apply leaves both the committed drawing and editable draft intact; validation and actions remain visible while content scrolls.
+Context controls float over the price plot without resizing or replacing its canvas. They yield to held drawing/chart gestures, so selecting an object and clearing selection cannot swallow the first drag. A press chooses one owner and coordinate frame until release or cancellation; native updates, relayout, and redraw do not invent drawing movement. Movable unlocked bodies use Grab/Grabbing cursors; an anchored VWAP curve uses Pointer for selection and its start handle owns movement. Cursor and press picking share the same cached derived geometry and edit policy. Locked objects show NotAllowed and never pan the chart behind them. Chart inspection is cleared when drawing editing starts, and wheel navigation/arrow nudges cannot interleave with a held drawing edit.
+
+Window focus loss, resize, and native-context changes cancel held input; Escape ends drawing edits and chart pans. Each plot/grip explicitly resets its own input epoch without resetting neighboring scroll state; this does not rely on iced 0.13 list-key behavior. Release after a canceled drawing edit cannot commit its old preview.
+
+The object list includes hidden, locked, overlapping, and offscreen drawings. Properties accept exact UTC ISO-8601 values or integer milliseconds, prices, ink, line width/pattern, rectangle fill opacity, text/label size, text, and Fibonacci ratios as appropriate. Locking prevents movement, content, and appearance edits; explicit visibility, unlock, and deletion remain available. Invalid Apply leaves both the committed drawing and editable draft intact; validation and actions remain visible while content scrolls.
 
 Fibonacci defaults are **0%, 23.6%, 38.2%, 50%, 61.8%, 78.6%, 100%**, with **0% at B/end and 100% at A/start**: `price = b + ratio * (a - b)`. Reverse uses `a + ratio * (b - a)`. Ratios are editable, finite, and unique; negative and extension ratios are supported. Right extension is optional. Labels use actual computed native prices.
 
-Drawing commands and transient previews have separate geometry layers/history; they do not restart native sources, recalculate indicators, refit scales, or change CVD origins. Axis/grip ownership, existing wheel/pixel navigation, and lower-pane controls retain precedence. Opening a modal cancels held drawing edits and rejects stale gesture messages while native data continues updating.
+Measurement reports signed native-price change, percentage (undefined when the first price is zero), elapsed time, and the **inclusive count of actual loaded native bars** between its UTC anchors. It does not divide elapsed time by the nominal interval to fabricate a count. Anchors beyond loaded history mark the count partial. Its bounded, native-shaped two-line label stays inside the visible price plot.
+
+Drawing commands and transient previews have separate geometry layers/history; they do not restart native sources, recalculate indicators, refit scales, or change CVD origins. Contextual styles use exact drawing IDs/book generations and style-only undo deltas. Axis/grip ownership, existing wheel/pixel navigation, and lower-pane controls retain precedence. Modal entry cancels held drawing edits and rejects stale gesture messages while native data continues. The command palette specifically preserves creation anchors/tool/repeat and unapplied property/text drafts while suspending held drag/hover input.
 
 
 
@@ -131,7 +288,7 @@ Coinbase spot uses Coinbase Exchange; perpetual discovery/history uses **Coinbas
 
 ## Indicators
 
-Start with an empty chart and add only the indicators you want. **I** opens the manager. All instances are session-only; nothing is restored on restart.
+A fresh workspace has no indicators; **I** opens the manager to add only those you want. Subsequent launches restore committed instance IDs, order, specifications, source choices, and visibility, then recalculate from fresh native data.
 
 | Indicator | Initial parameters | Placement | Calculation |
 | --- | --- | --- | --- |
@@ -166,6 +323,7 @@ Parameters are editable. Add multiple instances of any type, such as EMA(20) and
 | Select / unselect exact native market | Ctrl+Shift+Space toggles cursor market | Single radio; Selected / All checkbox |
 | Retry failed source discovery | Ctrl+R | Retry source discovery |
 | Choose CVD reset | Ctrl+Shift+R cycles Continuous / UTC day | Typed reset dropdown |
+| Scroll parameter / source content | PageUp / PageDown | Parameter/source scrollbar or wheel |
 
 Mode radios stay visible. **Single** replaces draft membership only when an exact native market is explicitly chosen; **Selected / All** allow direct check/uncheck. The `>` keyboard cursor is separate from inclusion. Each exchange checklist row shows pending/failed discovery, native eligibility, chosen count, unavailable choices, and All required/missing state. Clicking an unchecked venue or Browse only reveals its markets; it never guesses a symbol. Unchecking an included venue explicitly removes all its draft choices. Unavailable chosen markets remain individually removable. Changes stay drafts until Apply, and invalid Apply leaves committed instances untouched.
 
@@ -267,36 +425,52 @@ Sources: [Binance inverse base kline fields](https://developers.binance.com/lega
 
 
 
-## Omarchy colors
+## Colors and optional Omarchy integration
 
-The desktop reads the active palette once per second and updates chart and interface colors without restarting:
+Without a configured theme, the app uses a colorful built-in dark palette: navy background **`#111827`**, near-white text **`#E5E7EB`**, mint rising candles **`#34D399`**, coral falling candles **`#F87171`**, blue accents **`#60A5FA`**, and slate secondary text **`#94A3B8`**. **No Omarchy installation or theme file is required, and absence is not a theme error.**
+
+On Linux, optional Omarchy discovery polls once per second and updates chart/interface colors without restarting:
 
 - `$XDG_STATE_HOME/omarchy/current/theme/colors.toml`, defaulting to `~/.local/state/omarchy/current/theme/colors.toml`.
 - Older installations: `$XDG_CONFIG_HOME/omarchy/current/theme/colors.toml`, defaulting to `~/.config/omarchy/current/theme/colors.toml`.
 
-Uses semantic background, foreground, red, green, accent/blue, and muted colors; legacy `bg`/`fg` and ANSI `colorN` aliases are accepted. Contrast is corrected once at palette load/reload toward a readable foreground, without changing desktop configuration; grids remain subordinate to series and inspection labels have background backing. Rising candle bodies are hollow and falling bodies filled, so direction remains distinguishable when semantic colors coincide. IDs, labels and line patterns continue to distinguish indicator series. An unreadable or malformed replacement retains the last valid palette and displays an error. If no palette has loaded yet, a built-in neutral palette is used with the error visible.
+macOS and Windows use the built-in palette unless **`MEXC_CHART_THEME`** specifies an explicit TOML path. That override works on all platforms and takes precedence over automatic discovery. An explicitly configured missing file, or an unreadable/malformed/disappearing selected theme, remains an error: retain the last good palette (or the built-in palette at startup), show the failure, and retry at runtime. Never silently replace a selected broken theme with another file.
 
-`MEXC_CHART_THEME=/path/to/colors.toml` overrides palette discovery, useful for testing without changing the desktop theme. The application never edits Omarchy configuration or installs hooks.
+Theme files use semantic background, foreground, red, green, accent/blue, and muted colors; legacy `bg`/`fg` and ANSI `colorN` aliases are accepted. Contrast is corrected once at palette load/reload toward a readable foreground. Rising candle bodies are hollow and falling bodies filled; IDs, labels and line patterns distinguish series without relying on color alone.
+
+Market/source badges inherit the active palette: accents identify selection, green identifies eligibility/coverage, red identifies failures/missing requirements, and neutral states identify pending/ineligible sources. State labels and native quantity/provenance remain explicit. Monochrome Omarchy themes remain monochrome rather than receiving forced standalone hues. The application never edits desktop configuration or installs hooks.
 
 ## Structure
 
-- `crates/model`: native market, instrument, catalog, candle, flow, and independently timestamped OI contracts. Shared models have no serialization dependency.
+- `crates/model`: native market, authoritative tick metadata, catalog, candle/flow/OI, and priced execution/coverage contracts. Shared models have no serialization dependency.
 - `crates/indicators`: typed configurations, instance lifecycle, and incremental numerical calculations; no iced or networking dependencies.
+- `crates/indicators/src/profiles.rs`: deterministic native-tick TPO/Volume calculations, exact quantities/value areas, cached contributions, session/DST bounds, and certified reference/mitigation lifecycles.
 - `crates/indicators/src/sources.rs`: per-instance source configuration, base-normalized inputs, strict common-origin CVD and native-time OI aggregation, contributor/as-of state, revision/dirty-suffix tracking.
 - `crates/data`: in-process `DataService` and four explicit native providers. Eight single-flight catalog slots share `Arc<Catalog>` results; successful discovery is cached for 60 seconds, failures for one second. Pooled clients handle ordinary requests and longer execution-archive downloads. Native subscriptions/replays use bounded channels, visible status, owned cancellation, and shared request pacing.
 - `crates/data/src/open_interest.rs`: public native per-instrument OI history/snapshots, capability and timestamp provenance, retention/cursor handling, and cancellation-safe polling.
+- `crates/data/src/executions.rs` and provider execution adapters: shared native execution ownership, priced history/live/archive ingestion, identity reconciliation, explicit coverage/revocation, and cancellation.
 - `crates/desktop/src/state.rs`: chronological contiguous candles, merge-generation protection, viewport, independent pane scales, indicator instances, inspection, and typed `Action` commands. Ordered flow batches walk candles once and recalculate one affected CVD suffix.
 - `crates/desktop/src/chart.rs`: visible-range cached Canvas geometry, pointer-to-action translation, and independent value/shared time transforms. Series and histogram geometry are clipped before rendering; far-offscreen manual scales cannot trigger unbounded dashed-path expansion.
+- `crates/desktop/src/chart_surface.rs`: stable canvas layout, capture-aware floating chrome/layers, and per-plot/grip input epochs that preserve unrelated widget state.
+- `crates/desktop/src/pointer_input.rs`: window-root event-time cursor routing before scroll transforms; prevents a batch's final cursor position from relocating earlier presses.
 - `crates/desktop/src/main.rs`: command dispatch, request sequencing, keyboard/button adapters, and the small interface.
 - `crates/desktop/src/indicator_manager.rs`: keyboard/mouse editor that translates configuration operations into the same typed actions.
 - `crates/desktop/src/market_selector.rs`: searchable exchange/product/quote/native-timeframe editor; validated selection uses the same typed actions as keyboard shortcuts.
+- `crates/desktop/src/profiles_runtime.rs`, `profile_controls.rs`, and `profile_layer.rs`: independent execution/native-minute jobs, generation-fenced background calculations, estimation/provenance controls, stable inspection, and passive histograms with explicit editable fixed-range rails.
 - `crates/desktop/src/key_help.rs`: borrowed shortcut catalog, context ordering, and state-preserving modal input/overlay isolation.
+- `crates/desktop/src/command_palette.rs`: contextual searchable typed-command targets, query/navigation, and keyboard-help registry reuse.
+- `crates/desktop/src/goto_time.rs`: strict UTC editor; the window controller owns sequential native paging and coverage feedback.
+- `crates/desktop/src/stress.rs`: explicitly labeled synthetic scenarios, bounded timing samples, and process-memory reporting; disabled in normal launches.
 - `crates/desktop/src/feeds.rs`: owned native producers and ordered Iced batches, capped at 64 events or 16 ms; one shared subscription scope rather than per-event market-string copies. Cancellation/drop stops native I/O and provider children.
 - `crates/desktop/src/source_feeds.rs` / `source_controller.rs`: scoped base-quantity producers, independent CVD/OI ownership, shared source demand, discovery, live/history merging, pagination targets, and targeted external-pane invalidation.
 - `crates/desktop/src/history.rs`: grouped request, cancellation, progress, retry, and repair state; history pages are shared through `Arc<HistoryPage>`.
-- `crates/desktop/src/palette.rs`: runtime Omarchy palette loading.
-- `crates/desktop/src/pane_resize.rs`: session-only Canvas grips, anchored height adjustment, cancellation and double-click reset.
+- `crates/desktop/src/palette.rs`: colorful built-in palette, optional Linux Omarchy discovery, and explicit cross-platform theme overrides with live reload.
+- `crates/desktop/src/pane_resize.rs`: Canvas grips, anchored height adjustment, cancellation and double-click reset; committed heights are saved by workspace persistence.
 - `crates/desktop/src/presentation.rs`: native quantity disclosure, bounded nice-number ticks and UTC calendar ticks.
+- `crates/desktop/src/workspace.rs`: desktop-only versioned durable DTOs, structural/native-configuration validation, and scoped reset snapshots.
+- `crates/desktop/src/workspace_store.rs` / `workspace_store_platform.rs`: native per-user storage, process locks, synchronized atomic checkpoint/backup writes, recovery and authoritative reset replay.
+- `crates/desktop/src/workspace_runtime.rs`: startup revalidation, dirty/debounced save lifecycle, normal-close flush, revision fencing, and restore/reset integration.
+- `crates/desktop/src/workspace_controls.rs`: themed keyboard-accessible confirmation and failed-close choices, shared by palette/F1/button commands.
 
 State is the source of truth, not rendered geometry. Built-in indicators extend the typed kind/spec and manager; calculated indicators use structured candle-aligned points, while native-backed OI retains its independent source series. No dynamic plugin registry or scripting runtime is included.
 
@@ -319,11 +493,14 @@ Binance USDⓈ-M kline streams use the documented [`/market/ws` route](https://d
 
 ```rust
 data.catalog(exchange, product).await?;
+data.retry_catalog(exchange, product).await?; // Explicit retry of completed failed discovery
 data.history(&market, before).await?;
 data.history_with_flow(market, before, history_sender).await?;
 data.stream(market, cvd, market_sender, shutdown).await?;
 data.open_interest_history(&market, before_ms).await?;
 data.open_interest_stream(market, oi_sender, shutdown).await?;
+data.execution_history(&market, start_ms, end_ms).await?;
+data.execution_stream(market, execution_sender, shutdown).await?;
 data.history_in_base(&market, before).await?;
 data.history_with_flow_in_base(market, before, history_sender).await?;
 data.stream_in_base(market, cvd, market_sender, shutdown).await?;
@@ -336,6 +513,8 @@ Catalogs contain only eligible native instruments and supported intervals. Histo
 Optional CVD enrichment sends `HistoryEvent::History { page: Arc<HistoryPage> }` first, followed by native flow/progress and exactly one `Finished` or `Error` terminal event while the consumer is active. Binance embeds native taker flow in its candles and needs no separate replay. Dropping the request/receiver cancels enrichment; dropping the live subscription stops its producer and native children.
 
 OI history returns ascending `OpenInterestSample` observations, support/unit/cadence metadata, and an exclusive `next_before_ms` cursor. The independent stream sends `OpenInterestEvent::Support`, a shared native history page when available, actual samples, and source status. Quantities remain finite/nonnegative; venue and observed receipt timestamps are distinct. Watch shutdown or receiver-drop cancels validation, HTTP reads, queue sends, and timers. Historical errors remain explicit while live observations continue.
+
+Execution history returns native decimal `Execution { time_ms, id, price, quantity }` rows and half-open positive-proof coverage spans. Streams publish shared execution pages, native status, and explicit invalidations. Identity, coverage and source ownership are per native instrument, not displayed candle interval. Subscribers deduplicate their own rows so recovery replay can restore a lagged consumer's missing quantities before coverage becomes complete.
 
 The explicit `_in_base` APIs preserve native OHLC/candle volume while normalizing flow `delta`/`volume` and OI quantity into the catalog base asset. Normalization does not alter quality, coverage, timestamps, cancellation, or terminal ownership. Base OI validates the instrument independently of candle timeframe. `mexc_data::base_quantity_factor` exposes only authoritative spot/linear scaling; inverse/undocumented conversions are rejected.
 
@@ -352,7 +531,61 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release --workspace
 ```
 
-The integrated workspace passes **217 tests**, strict Clippy, formatting, and a release build. Behavioral coverage includes numerical seeds/warmup, provisional replacement, corrections/prepends, CVD coverage precedence and origins, independent scales, anchored axis gestures, extreme segment clipping, active-pane keyboard zoom, stale callbacks, repair cursors, modal input isolation, native OI identity/units/timestamp provenance, exclusive history, zero/invalid samples, deduplication/live precedence, gap rendering, and instrument-versus-timeframe transitions. Source coverage includes authoritative inverse/linear base conversion, strict shared CVD origins, as-of skew, OI freshness/gap recovery, transactional source edits, per-source lifetimes, and connected-resync repair without falsely disconnecting. Phase 1 regressions cover direct interval validation against the active catalog after cancelled foreign discovery, unsupported intervals leaving the chart intact, native OI retention, and independent typed CVD resets with unchanged IDs/source membership.
+Standalone/portability verification passed workspace/all-target tests, strict stable Clippy, an optimized desktop build, and the full Rust 1.89 workspace/all-target compile check. Full workspace/all-target cross-checks passed for **Windows x86-64 GNU** and **macOS ARM64** with a temporary cross C compiler; those are compilation checks, not native GUI runs. The native CI matrix defines real platform test/build jobs but was not executed from this Linux session. macOS currently inherits an upstream `block 0.1.6` future-Rust-compatibility warning, which did not fail the cross-check.
+
+Real Linux Wayland smoke used isolated HOME/XDG storage and native MEXC prices: the former neutral palette/missing-theme warning were reproduced, then the new colorful chart/settings ran without Omarchy or a theme warning. Existing VWAP identity restored, RSI autosaved/restored, and application-directory/checkpoint/backup/lock permissions remained 0700/0600. Optional live discovery loaded the actual desktop palette copied only into the private smoke root; a malformed replacement retained its colors with an error. Native Windows/macOS window/input/graphics execution still requires those operating systems; no equivalent runtime claim is made from cross-checks.
+
+An explicitly missing theme override showed an error alongside the built-in colors instead of silently selecting an automatic theme. Creating the requested file loaded it live and cleared the warning while both saved indicator instances and native prices remained active.
+
+VWAP acceptance passed **503 workspace tests**, strict all-target Clippy, and an optimized desktop build. Native Wayland checks used real MEXC BTC_USDC candles, the active Omarchy palette and private XDG storage at **749×814 and 520×560 logical pixels**: independent day/week/month/custom resets, real month-origin history paging from Partial to covered, source/formula/units disclosure, and focused custom-session fields revealed above fixed actions. Anchored checks covered native-candle keyboard placement, start-handle movement without camera/native-binding changes, exact millisecond UTC editing, undo/redo, hide/lock, deletion/undo, 5m→15m recalculation and relaunch restoration. Cursor regression reproduced uncached derived-curve picking before the fix; hover and held feedback now share actual curve geometry/edit capability. A genuine schema-3 checkpoint upgraded to 4 through native VWAP addition while preserving all four existing profile configurations, including exact-only policy, hidden native binding and millisecond fixed bounds.
+
+Scroll/modal/resize acceptance used real Wayland input, native BTC_USDC data, the active Omarchy palette, and isolated workspace storage at **749×814 logical pixels**. Scrolling retained pointer-aligned price crosshairs and shared lower-pane inspection. Burst price resizing continued across scrollbar appearance (340→420), a scrolled price drag reached 480, and a burst RSI grip drag reached 250 from 190 without changing the time viewport or automatic scales. Repeated CVD source radios, labels/padding, nested reset selection, invalid All-source Apply, and an inside press released outside retained the editor/draft; a valid Chart-source UTC-day Apply retained the instance ID and committed its reset. A fast combined modal sequence also reproduced iced's final-cursor batching error before window-root routing fixed it.
+
+Drawing-input reliability acceptance used real Wayland pointer/keyboard events and isolated XDG storage at **749×814 and 520×560 logical windows**. It reproduced first-selection plot displacement and a lost first background pan, then verified immediate line dragging without camera changes, the first deselection/background drag, rectangle body/corner edits, selected Fibonacci endpoint priority over an overlapping rectangle, and locked-object rejection without camera movement. Space-pan released over floating controls did not leave a ghost drag. Holding Space across an actual focus transfer and releasing it in another owned window no longer stole the first post-focus drawing drag. Resize canceled an unfinished drawing edit and a held pane grip; RSI panning retained independent value bounds, shared time, and unchanged drawing geometry. Opaque themed chrome remained above cached candle meshes rather than losing its background to renderer-layer ordering.
+
+Phase 9 native Wayland acceptance used isolated XDG storage with the active Omarchy palette: default restart restored exact ETH_USDC/5m, stable indicator/drawing IDs, a collapsed manually scaled RSI pane, and an older historical viewport after real native history paging. A normal close immediately after adding MACD flushed the addition before the debounce elapsed. Clear-current cancellation preserved everything; confirmation removed the current instrument's hidden/locked drawing and indicators while retaining the BTC book and exact saved markets across another restart. Reset-everything restored empty defaults. An actual filesystem write failure kept the window open with Retry selected; repairing the path and retrying saved the newest state before exit. A damaged main file was quarantined and its validated backup restored with a visible warning. An unknown newer schema remained byte-for-byte untouched after a rejected partial clear.
+
+The final optimized release was also checked at **749×814 and 520×560 logical windows**: reset scope text and keyboard selection remained readable, an unavailable saved symbol stayed offline until explicit native-market repair, and the repaired exact identity was automatically saved. A clean protected workspace closed without a false save-failure prompt; editing it instead required an explicit exit without saving and left the newer file untouched. Explicit Reset everything replaced that newer file only after confirmation. A final ordinary restart restored the historical chart centered on `2026-10-10 12:00 UTC`, including the correct center notice. A 20-second synthetic stress launch created no workspace directory in its isolated state root.
+
+Phase 8 native Wayland acceptance exercised **749×814 and 520×560 logical windows**: searched EMA/RSI/MACD additions, existing-instance settings/details, editor-context command exclusion, second-field MACD draft/focus restoration, keyboard pane reorder/maximize/restore, exact session favorites and native BTC→ETH→BTC quick switching, invalid UTC date correction, sequential history loading to an older UTC target, and return-live cancellation. Drawing checks covered repeated Trend and Text commits, mouse/keyboard anchors, first-anchor preservation through palette cancellation, contextual style/undo, Escape disarming Repeat, and a complete right-edge measurement label showing signed price/time and eleven actual loaded bars. Native external MEXC OI displayed base BTC quantities and exact observation provenance, then an explicit retry exposed the named disconnected contributor and remedy while prices remained live.
+
+Renderer-load commands use the real iced/Wayland window but **explicitly synthetic fixtures, with no native feeds**:
+
+```sh
+./target/release/mexc-chart --stress-small
+./target/release/mexc-chart --stress
+```
+
+Each runs for 20 seconds, automatically pans every 200 ms, prints timings and exits. **Linux** additionally reports RSS/high-water marks from `/proc/self/status`; other platforms explicitly mark those Linux-only memory metrics unavailable. Small is **1,000 bars / 10 drawings / 3 indicators**; large is **100,000 bars / 1,000 drawings / 24 indicators**. Normal launches have neither fixture data nor timing collection. Timing sample rings are bounded to 4,096 entries.
+
+Observed optimized runs at the same **749×814 logical Wayland size**, with no concurrent build/native chart:
+
+| Metric | Small final | Large before cache fix | Large final |
+| --- | ---: | ---: | ---: |
+| Input handler CPU p95 (ms) | 0.0343 | 0.2467 | 0.2378 |
+| Widget-tree CPU p95 (ms) | 0.1328 | 0.6150 | 0.5916 |
+| Mixed canvas build/cache-call p95 (ms) | 0.8617 | 83.0772 | 0.1397 |
+| Mixed canvas build/cache-call max (ms) | 3.1338 | 142.2365 | 75.3730 |
+| Input→redraw-event p95 (ms) | 0.2807 | 1.8737 | 1.6668 |
+| Process RSS / high-water mark (KiB) | 78,348 | 258,940 | 260,080 |
+
+Dense native-price labels exceeded the former 64-entry annotation LRU and reshaped on each pan. The cache now retains an **8,192-shaped-glyph budget**, with oversized layouts uncached and the active annotation pinned separately. Mixed canvas samples include both cache lookups and rebuilds; their different hit/rebuild proportions mean these percentiles are **not a per-frame speedup ratio**. Startup/rebuild costs are included, and the measured maximum remains visible in the table. Input→redraw is event-loop notification, **not GPU presentation latency**. These short fixtures do not establish a memory-leak result, session-memory bound, sustained GPU frame rate, or live-feed performance guarantee.
+
+The integrated workspace passes its behavioral tests, strict Clippy, formatting, and a release build. Behavioral coverage includes numerical seeds/warmup, provisional replacement, corrections/prepends, CVD coverage precedence and origins, independent scales, anchored axis gestures, extreme segment clipping, active-pane keyboard zoom, stale callbacks, repair cursors, modal input isolation, native OI identity/units/timestamp provenance, exclusive history, zero/invalid samples, deduplication/live precedence, gap rendering, and instrument-versus-timeframe transitions. Source coverage includes authoritative inverse/linear base conversion, strict shared CVD origins, as-of skew, OI freshness/gap recovery, transactional source edits, per-source lifetimes, and connected-resync repair without falsely disconnecting. Phase 1 regressions cover direct interval validation against the active catalog after cancelled foreign discovery, unsupported intervals leaving the chart intact, native OI retention, and independent typed CVD resets with unchanged IDs/source membership. Profile regressions cover candle fallback, Decimal conservation/headroom, partial-minute bounds, exact recovery without double counting, zero-volume provenance, bounded contribution caches, paste-safe shortcuts, explicit range hit targets and native-bound endpoint/translation edits. Exact-ID settings search retains precedence over range-selection metadata.
+
+Workspace regressions cover validated DTO round trips, stable IDs, native-data exclusion, atomic checkpoint/backup recovery, private storage and locking, future-schema preservation, authoritative reset replay, stale epoch/revision rejection, close-save failures and retries, and protected read-only workspaces prompting on close only after actual configuration edits.
+
+Profile regressions cover block deduplication/replacement, exact quantity conservation/corrections, deterministic POC/value-area boundaries, genuine reference origins, Single Prints versus tails and mitigation, exact Initial Balance, native-minute visible bounds, custom-session DST/gap/overnight behavior, independent source windows, bounded tail repair, stale publication, millisecond range round trips, and schema-1→2 configuration migration.
+
+Native profile smoke exercised priced history/live feeds alongside CVD for Binance Spot/USDⓈ-M/COIN-M, OKX Spot/linear/inverse swaps, Coinbase spot, and MEXC futures; quantities were checked against canonical native executions. Official historical archives were exercised for Binance spot/linear/inverse and OKX spot. MEXC spot's missing tick metadata and Coinbase International's unavailable native listing/source stayed explicit. Real Wayland workflows exercised default persistence/relaunch, legacy migration with existing indicators/drawings, independent display intervals, mouse/keyboard fixed ranges, native covered Volume Profiles, source retry, native bindings, scrolled/narrow keyboard focus, drawing drags, crosshair alignment and resize capture. No profile frame-rate benchmark or vendor-parity claim is made.
+
+Native workspace checks confirmed that Enter initially cancels, scoped clear removes chart-following/current-native profiles while retaining another instrument's fixed profiles/drawing book, and full reset empties both checkpoint and recovery backup with a newer reset epoch. A native fixed Volume Profile disclosed its exact decimal quantity without floating noise; repeated display-option Apply preserved manually edited millisecond boundaries.
+
+The profile improvements were also exercised in native Wayland: ordinary indicator type selection created TPO/visible VP, Draw created a native-bound fixed VP, body/endpoint drags preserved chart view and binding, Escape canceled a range preview, exact-only toggled persistently, and populated/empty inspection bands retained the same header/plot origin. Compact 520×560 settings kept the estimate toggle and fixed actions accessible.
+
+Native schema-2 → 3 migration and relaunch retained fixed millisecond bounds, native bindings, row grids and exact-only policy. Ctrl+1/2/7/9 changed only the intended flags while numeric fields were focused; they no longer typed digits into row/block settings. The compact editor reserves the same scrollbar gutter as the wide editor. Palette selection, Ctrl+E settings, Ctrl+H visibility and Delete removal were exercised on a persisted fixed profile; unrelated profile IDs remained intact.
+
+Pointer regressions cover scroll-translated inspection/drawing picks and drag commits, clipped-cursor rejection, dialog padding/reselected radios, nested dropdown selection, both directions of batched inside/outside presses, rapid and partially rendered resize requests, and keyboard resize canceling held pointer input without canceling ordinary pointer height updates.
 
 Phase 2 regressions cover editor/details navigation isolation while native callbacks advance the chart, manual bounds preserved through modal closure, explicit Chart-source repair retaining instance ID/reset/visibility and other source ownership, and targeted retries making shared dependent totals incomplete until fresh data arrives while rejecting old-generation samples.
 
@@ -363,6 +596,10 @@ Phase 4 regressions cover height/collapse lifecycle and finite bounds, unchanged
 Drawing regressions cover exact instrument-book identity, timeframe independence, atomic invalid edits, stable IDs/order and per-book undo/redo, lock enforcement, no-op history, projection/clipping, ray direction, rectangle bounds/corners, Fibonacci direction/results, actual-candle OHLC snapping, native Unicode text bounds/cache behavior, keyboard first-anchor positioning, transactional previews, modal cancellation/stale releases, captured modal-key ownership, and selection across relayout without accidental geometry edits. Desktop transactions leave viewport/scales, market/source generations, indicator outputs, and CVD origins unchanged.
 
 Actual drawing Wayland smoke exercised all seven tools at **749×814 and 520×560 logical pixels**, mouse and keyboard creation, Unicode text and empty-text validation, exact Fibonacci prices/ratios/reverse/extension, endpoint and rectangle-corner resizing, body translation, one-step undo/redo, configured fill opacity and selected color/dash preservation, hidden/locked object management, deletion/restoration, actual OHLC magnet placement, property scrolling and fixed validation/actions, and clean creation-mode guidance. It verified native PEPE_USDC nine-decimal labels, timeframe reprojection, BTC→ETH→BTC book restoration, restart clearing, modal cancellation during a held edit with live prices advancing, low-contrast dark/light palettes, Space-drag over drawings, axis zoom, grip resizing, true continuous trackpad pixel panning, and a drawing-free RSI lower pane sharing time/inspection.
+
+UI-polish release smoke exercised **749×814 and 520×560 logical Wayland windows** with native BTC_USDC and nine-decimal PEPE_USDC prices. It covered mouse/keyboard drawing creation, wide A/B cards versus narrow stacked anchors, exact-price and ratio edits, duplicate-ratio validation without draft loss, hidden/locked object management, multi-instance EMA/RSI creation and exact-instance editing, native symbol search/Apply, explicit source-mode eligibility, PageDown access to source content, empty-manager field visibility, help selection/scrolling/modal shading, and dark/light/monochrome surfaces. Native canvas antialiasing is enabled; no performance benchmark is claimed. Existing numerical, source-generation, history, drawing-transaction, and modal-isolation tests remain passing.
+
+Theme/density Wayland smoke exercised market search, native Apply and nine-decimal price readouts, native-contract and external base-quantity OI, exact contributor coverage/provenance, All-source missing-venue validation, fixed errors through PageDown, and help without losing the source draft. It verified full-width empty editors and intrinsic-width source badges at 749×814 and 520×560, with app-only live reloads between Tokyo Night, Catppuccin Latte, and the active monochrome Omarchy palette. Native OI Details retained cadence, history limitations, and receipt-time provenance without repeating its status/support text.
 
 Direct-service runtime smoke exercised all eight exchange/product catalogs with shared `Arc` identity, recent and exclusive older history on eight liquid feeds across the seven active scopes, price-first enrichment, exactly-once completion, and receiver/watch cancellation. Every live feed delivered native prices and finalized flow buckets: Binance Spot/USDⓈ-M/COIN-M, OKX Spot/Swap, Coinbase Spot, and MEXC Spot/Perpetual. MEXC historical perpetual flow remained explicitly missing; OKX/Coinbase replay progress and cancellation were observed.
 

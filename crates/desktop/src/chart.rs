@@ -3,17 +3,20 @@ use crate::{
     drawing_geometry::{self, Projection},
     drawing_interaction::Input as DrawingInput,
     drawing_layer,
-    drawing_types::{Anchor, Tool},
+    drawing_types::{Anchor, Drawing, Part, Tool},
     palette::Palette,
     presentation::{self, TimeTicks, ValueTicks, quantity, quantity_exact},
+    profile_layer,
+    source_controller::{BlockerKind, ContributorHealth, Remedy, SourceBlocker, SourceHealth},
     state::{Action, ChartState},
+    ui,
 };
 use iced::widget::canvas::{Cache, Frame, Geometry, Path, Stroke, Text};
 use iced::widget::{Column, Row, button, canvas, column, mouse_area, row, text};
 use iced::{
     Alignment, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme, keyboard, mouse,
 };
-use mexc_indicators::{IndicatorInstance, IndicatorPoint, IndicatorSpec};
+use mexc_indicators::{IndicatorInstance, IndicatorPoint, IndicatorSpec, SourceCondition};
 use mexc_model::{FlowQuality, OpenInterestSample, OpenInterestTimestamp, Product};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +28,9 @@ pub struct Chart<'a> {
     pub quote: &'a str,
     pub volume_unit: &'a str,
     pub drawings: Option<drawing_layer::View<'a>>,
+    pub profiles: Option<profile_layer::View<'a>>,
+    pub profile_range: Option<profile_layer::RangePlacement>,
+    pub metrics: Option<&'a crate::stress::Metrics>,
 }
 
 #[derive(Default)]
@@ -33,7 +39,26 @@ pub struct Interaction {
     last_press: Option<(Instant, Point, Region)>,
     modifiers: keyboard::Modifiers,
     space_pan: bool,
-    drawing_claim: Option<u64>,
+    drawing_claim: Option<DrawingClaim>,
+    profile_claim: Option<(profile_layer::RangeDrag, Projection)>,
+}
+
+#[derive(Clone, Copy)]
+struct DrawingClaim {
+    generation: u64,
+    hit: Option<crate::drawing_types::Hit>,
+    origin: Point,
+    projection: Projection,
+}
+
+impl Interaction {
+    pub(super) fn owns_pointer(&self, drawing_generation: Option<u64>) -> bool {
+        self.drag.is_some()
+            || self.profile_claim.is_some()
+            || self
+                .drawing_claim
+                .is_some_and(|claim| Some(claim.generation) == drawing_generation)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,6 +75,20 @@ fn region(point: Point, area: Rectangle) -> Region {
         Region::PriceAxis
     } else {
         Region::Plot
+    }
+}
+
+fn drawing_cursor(drawing: &Drawing, part: Part, held: bool) -> mouse::Interaction {
+    if drawing.locked {
+        mouse::Interaction::NotAllowed
+    } else if !drawing.can_drag(part) {
+        mouse::Interaction::Pointer
+    } else if held {
+        mouse::Interaction::Grabbing
+    } else if part == Part::Body {
+        mouse::Interaction::Grab
+    } else {
+        mouse::Interaction::Crosshair
     }
 }
 
@@ -337,15 +376,37 @@ impl Chart<'_> {
 /// Distinct state tags discard held pointer gestures when a modal blocks input.
 struct BlockedChart<'a>(Chart<'a>);
 
-pub fn view<'a>(chart: Chart<'a>, height: Length, blocked: bool) -> Element<'a, Message> {
-    if blocked {
+pub fn view<'a>(
+    chart: Chart<'a>,
+    height: Length,
+    blocked: bool,
+    toolbar: Option<Element<'a, Message>>,
+    input_generation: u64,
+) -> Element<'a, Message> {
+    let generation = chart
+        .drawings
+        .as_ref()
+        .map(|drawings| drawings.interaction.generation());
+    let target = chart.indicator.map(|instance| instance.id);
+    let canvas = if blocked {
         canvas(BlockedChart(chart))
             .width(Length::Fill)
-            .height(height)
+            .height(Length::Fill)
             .into()
     } else {
-        canvas(chart).width(Length::Fill).height(height).into()
-    }
+        canvas(chart)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    };
+    crate::chart_surface::view(
+        canvas,
+        toolbar,
+        height,
+        blocked,
+        generation,
+        (input_generation, target),
+    )
 }
 
 impl canvas::Program<Message> for BlockedChart<'_> {
@@ -380,20 +441,170 @@ impl canvas::Program<Message> for Chart<'_> {
         cursor: mouse::Cursor,
     ) -> (canvas::event::Status, Option<Message>) {
         use canvas::event::Status::{Captured, Ignored};
+        if state.drag.is_some()
+            && matches!(&event, canvas::Event::Keyboard(keyboard::Event::KeyPressed { key, .. })
+                if matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Escape)))
+        {
+            state.drag = None;
+            state.space_pan = false;
+            state.last_press = None;
+            return (Captured, Some(Message::PointerCancelled));
+        }
         let area = plot(
             bounds.size(),
             axis_width(self.data, self.quote, self.volume_unit),
         );
-        let local = cursor
-            .position()
-            .map(|point| Point::new(point.x - bounds.x, point.y - bounds.y));
-        let inside = cursor.position_in(bounds);
+        // Scrollable translates the routed cursor into content coordinates but
+        // leaves CursorMoved.position in window coordinates.
+        let position = cursor.position();
+        let local = position.map(|point| Point::new(point.x - bounds.x, point.y - bounds.y));
+        let inside = position.filter(|point| bounds.contains(*point)).and(local);
+        // Explicit fixed-range rails share pointer ownership with drawings/chart
+        // gestures; profile histograms themselves remain passive.
+        if let Some((mut drag, projection)) = state.profile_claim {
+            match &event {
+                canvas::Event::Keyboard(keyboard::Event::KeyPressed { key, .. })
+                    if matches!(
+                        key.as_ref(),
+                        keyboard::Key::Named(keyboard::key::Named::Escape)
+                    ) =>
+                {
+                    state.profile_claim = None;
+                    return (Captured, Some(Message::PointerCancelled));
+                }
+                canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                    if let Some(anchor) = local.and_then(|point| projection.anchor(point)) {
+                        drag.update(anchor.utc_ms);
+                        state.profile_claim = Some((drag, projection));
+                    }
+                    return (Captured, Some(Message::Action(Action::Inspect(None))));
+                }
+                canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    state.profile_claim = None;
+                    if drag.preview_start == drag.start_ms && drag.preview_end == drag.end_ms {
+                        return (Captured, None);
+                    }
+                    return (
+                        Captured,
+                        Some(Message::ProfileEdit(profile_layer::Edit::Range {
+                            id: drag.id,
+                            start_ms: drag.preview_start,
+                            end_ms: drag.preview_end,
+                        })),
+                    );
+                }
+                canvas::Event::Mouse(
+                    mouse::Event::WheelScrolled { .. } | mouse::Event::ButtonPressed(_),
+                ) => return (Captured, None),
+                _ => {}
+            }
+        }
+        let held = state.owns_pointer(
+            self.drawings
+                .as_ref()
+                .map(|view| view.interaction.generation()),
+        ) || self
+            .drawings
+            .as_ref()
+            .is_some_and(|view| view.interaction.captures_pointer());
+        if self.profile_range.is_some() && self.indicator.is_none() && !held {
+            if matches!(&event, canvas::Event::Keyboard(keyboard::Event::KeyPressed { key, .. })
+                if matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Escape)))
+            {
+                return (
+                    Captured,
+                    Some(Message::Profile(
+                        crate::profile_controls::Event::RangeCancel,
+                    )),
+                );
+            }
+            if !state.space_pan
+                && matches!(
+                    event,
+                    canvas::Event::Mouse(
+                        mouse::Event::ButtonPressed(mouse::Button::Left)
+                            | mouse::Event::CursorMoved { .. }
+                    )
+                )
+                && let Some(point) = inside
+                && let Some(projection) = self
+                    .data
+                    .latest()
+                    .and_then(|_| Projection::new(self.data.viewport, area))
+                && projection.contains(point)
+                && let Some(anchor) = projection.anchor(point)
+            {
+                state.last_press = None;
+                let input = if matches!(event, canvas::Event::Mouse(mouse::Event::ButtonPressed(_)))
+                {
+                    crate::profile_controls::Event::RangePoint(anchor.utc_ms)
+                } else {
+                    crate::profile_controls::Event::RangeCursor(anchor.utc_ms)
+                };
+                return (Captured, Some(Message::Profile(input)));
+            }
+        }
+        if !held
+            && !state.space_pan
+            && self.profile_range.is_none()
+            && self.indicator.is_none()
+            && matches!(
+                event,
+                canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+            )
+            && let (Some(profiles), Some(point), Some(projection)) = (
+                self.profiles.as_ref(),
+                inside,
+                self.data
+                    .latest()
+                    .and_then(|_| Projection::new(self.data.viewport, area)),
+            )
+            && projection.contains(point)
+            && self.drawings.as_ref().is_none_or(|drawings| {
+                drawings.interaction.tool() == Tool::Select
+                    && drawing_geometry::hit_test_cached(
+                        drawings.store.objects(),
+                        drawings.store.selected(),
+                        projection,
+                        point,
+                        Some(drawings.store),
+                    )
+                    .is_none()
+            })
+            && let Some(drag) = profiles.hit_range(projection, point)
+        {
+            state.last_press = None;
+            state.profile_claim = Some((drag, projection));
+            return (
+                Captured,
+                Some(Message::ProfileEdit(profile_layer::Edit::Select(drag.id))),
+            );
+        }
+        // A press establishes a new owner; an old gesture cannot veto hit testing.
+        if matches!(
+            event,
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+        ) {
+            state.drag = None;
+            state.drawing_claim = None;
+        }
+        if state.drawing_claim.is_some_and(|claim| {
+            self.drawings
+                .as_ref()
+                .is_none_or(|drawings| claim.generation != drawings.interaction.generation())
+        }) {
+            state.drawing_claim = None;
+        }
+        if matches!(
+            event,
+            canvas::Event::Mouse(mouse::Event::WheelScrolled { .. })
+        ) && (state.drag.is_some() || state.drawing_claim.is_some())
+        {
+            return (Captured, None);
+        }
         let mut clear_drawing_selection = None;
         if let Some(drawings) = &self.drawings {
             let generation = drawings.interaction.generation();
-            if state.drawing_claim.is_some_and(|claim| claim != generation) {
-                state.drawing_claim = None;
-            }
             let projection = self
                 .data
                 .latest()
@@ -464,26 +675,27 @@ impl canvas::Program<Message> for Chart<'_> {
                     return (Ignored, None);
                 }
                 canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
-                    if !state.space_pan && state.drag.is_none() =>
+                    if !state.space_pan =>
                 {
                     if let (Some(point), Some(projection)) = (inside, projection)
                         && projection.contains(point)
                     {
-                        let hit = drawing_geometry::hit_test(
+                        let hit = drawing_geometry::hit_test_cached(
                             drawings.store.objects(),
                             drawings.store.selected(),
                             projection,
                             point,
+                            Some(drawings.store),
                         );
                         if drawings.interaction.tool() != Tool::Select || hit.is_some() {
-                            state.drawing_claim = Some(generation);
-                            let snap = drawings
-                                .interaction
-                                .magnet()
-                                .then(|| {
-                                    drawing_geometry::magnet(projection, point, self.data.visible())
-                                })
-                                .flatten();
+                            state.last_press = None;
+                            state.drawing_claim = Some(DrawingClaim {
+                                generation,
+                                hit,
+                                origin: bounds.position(),
+                                projection,
+                            });
+                            let snap = drawings.snap(projection, point);
                             return (
                                 Captured,
                                 message(DrawingInput::Down {
@@ -498,27 +710,36 @@ impl canvas::Program<Message> for Chart<'_> {
                     }
                 }
                 canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.drag.is_none() => {
-                    if let (Some(point), Some(projection)) = (local, projection) {
-                        let claimed =
-                            state.drawing_claim.is_some() || drawings.interaction.is_dragging();
+                    let pointer = if let Some(claim) = state.drawing_claim {
+                        position.map(|point| {
+                            (
+                                Point::new(point.x - claim.origin.x, point.y - claim.origin.y),
+                                claim.projection,
+                            )
+                        })
+                    } else {
+                        local.zip(projection)
+                    };
+                    if let Some((point, projection)) = pointer {
+                        let claimed = state.drawing_claim.is_some();
                         if claimed || (inside.is_some() && projection.contains(point)) {
-                            let hit = projection
-                                .contains(point)
-                                .then(|| {
-                                    drawing_geometry::hit_test(
-                                        drawings.store.objects(),
-                                        drawings.store.selected(),
-                                        projection,
-                                        point,
-                                    )
-                                })
-                                .flatten();
-                            let snap = (drawings.interaction.magnet()
-                                && projection.contains(point))
-                            .then(|| {
-                                drawing_geometry::magnet(projection, point, self.data.visible())
-                            })
-                            .flatten();
+                            let hit = if claimed {
+                                state.drawing_claim.and_then(|claim| claim.hit)
+                            } else {
+                                projection
+                                    .contains(point)
+                                    .then(|| {
+                                        drawing_geometry::hit_test_cached(
+                                            drawings.store.objects(),
+                                            drawings.store.selected(),
+                                            projection,
+                                            point,
+                                            Some(drawings.store),
+                                        )
+                                    })
+                                    .flatten()
+                            };
+                            let snap = drawings.snap(projection, point);
                             let captured = claimed || drawings.interaction.tool() != Tool::Select;
                             return (
                                 if captured { Captured } else { Ignored },
@@ -532,26 +753,26 @@ impl canvas::Program<Message> for Chart<'_> {
                         }
                     }
                 }
-                canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-                    if state.drawing_claim.take().is_some()
-                        || drawings.interaction.is_dragging() =>
-                {
-                    if let (Some(point), Some(projection)) = (local, projection) {
-                        let snap = (drawings.interaction.magnet() && projection.contains(point))
-                            .then(|| {
-                                drawing_geometry::magnet(projection, point, self.data.visible())
-                            })
-                            .flatten();
-                        return (
-                            Captured,
-                            message(DrawingInput::Up {
-                                point,
-                                projection,
-                                snap,
-                            }),
-                        );
+                canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    if let Some(claim) = state.drawing_claim.take() {
+                        if let Some(position) = position {
+                            let point = Point::new(
+                                position.x - claim.origin.x,
+                                position.y - claim.origin.y,
+                            );
+                            let projection = claim.projection;
+                            let snap = drawings.snap(projection, point);
+                            return (
+                                Captured,
+                                message(DrawingInput::Up {
+                                    point,
+                                    projection,
+                                    snap,
+                                }),
+                            );
+                        }
+                        return (Captured, message(DrawingInput::Leave));
                     }
-                    return (Captured, message(DrawingInput::Leave));
                 }
                 canvas::Event::Mouse(mouse::Event::CursorLeft) => {
                     state.drawing_claim = None;
@@ -577,19 +798,20 @@ impl canvas::Program<Message> for Chart<'_> {
                 if inside.is_some() =>
             {
                 let point = inside.unwrap();
+                let absolute = position.unwrap();
                 let region = region(point, area);
                 let now = Instant::now();
                 let double = state
                     .last_press
                     .is_some_and(|(when, previous, previous_region)| {
                         now.duration_since(when) <= Duration::from_millis(350)
-                            && previous.distance(point) <= 5.0
+                            && previous.distance(absolute) <= 5.0
                             && region == previous_region
                     });
                 state.last_press = if double {
                     None
                 } else {
-                    Some((now, point, region))
+                    Some((now, absolute, region))
                 };
                 if double && region == Region::PriceAxis {
                     state.drag = None;
@@ -603,7 +825,7 @@ impl canvas::Program<Message> for Chart<'_> {
                         f64::from(point.x / area.width).clamp(0.0, 1.0),
                         (1.0 - f64::from(point.y / area.height)).clamp(0.0, 1.0),
                     );
-                    state.drag = Some((point, region, anchor));
+                    state.drag = Some((absolute, region, anchor));
                     Action::ActivatePane(self.indicator.map(|instance| instance.id))
                 }
             }
@@ -618,15 +840,16 @@ impl canvas::Program<Message> for Chart<'_> {
                     return (Ignored, None);
                 };
                 if let Some((previous, region, (x, y))) = state.drag {
-                    state.drag = Some((point, region, (x, y)));
+                    let absolute = position.unwrap();
+                    state.drag = Some((absolute, region, (x, y)));
                     if state
                         .last_press
-                        .is_some_and(|(_, initial, _)| initial.distance(point) > 5.0)
+                        .is_some_and(|(_, initial, _)| initial.distance(absolute) > 5.0)
                     {
                         state.last_press = None;
                     }
-                    let dx = f64::from(point.x - previous.x) / f64::from(area.width);
-                    let dy = f64::from(point.y - previous.y) / f64::from(area.height);
+                    let dx = f64::from(absolute.x - previous.x) / f64::from(area.width);
+                    let dy = f64::from(absolute.y - previous.y) / f64::from(area.height);
                     match region {
                         Region::Plot => self.pan_action(-dx, dy),
                         Region::TimeAxis => self.zoom_action((dx * 3.0).exp(), 1.0, x, y),
@@ -655,9 +878,9 @@ impl canvas::Program<Message> for Chart<'_> {
                 }
             }
             canvas::Event::Mouse(mouse::Event::CursorLeft) => {
-                if state.drag.is_some() {
-                    return (Ignored, None);
-                }
+                state.drag = None;
+                state.last_press = None;
+                state.space_pan = false;
                 Action::Inspect(None)
             }
             canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) if inside.is_some() => {
@@ -701,12 +924,13 @@ impl canvas::Program<Message> for Chart<'_> {
 
     fn draw(
         &self,
-        _state: &Interaction,
+        state: &Interaction,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
+        let _timing = self.metrics.map(crate::stress::Metrics::canvas_timer);
         if let Some(instance) = self.indicator {
             return self.draw_lower(instance, renderer, bounds);
         }
@@ -727,9 +951,8 @@ impl canvas::Program<Message> for Chart<'_> {
             // Keep the background in its own layer: iced 0.13 appends a parent
             // frame's pending meshes after clipped child meshes.
             frame.with_clip(Rectangle::with_size(bounds.size()), |frame| {
-                frame.fill_rectangle(Point::ORIGIN, bounds.size(), palette.background);
                 let grid = Color {
-                    a: 0.3,
+                    a: 0.16,
                     ..palette.muted
                 };
                 let latest_y = self
@@ -901,11 +1124,32 @@ impl canvas::Program<Message> for Chart<'_> {
                 );
             }
         }
-        let mut layers = Vec::with_capacity(if self.drawings.is_some() && projection.is_some() {
-            4
-        } else {
-            2
-        });
+        if let (Some(placement), Some(projection)) = (self.profile_range, projection) {
+            profile_layer::draw_range(
+                &mut overlay,
+                placement,
+                projection,
+                cursor.position_in(bounds),
+                palette,
+            );
+        }
+        if self.profile_range.is_none()
+            && let (Some(profiles), Some(projection)) = (&self.profiles, projection)
+        {
+            profiles.draw_ranges(
+                &mut overlay,
+                projection,
+                palette,
+                state.profile_claim.map(|(drag, _)| drag),
+            );
+        }
+        let mut background = Frame::new(renderer, bounds.size());
+        background.fill_rectangle(Point::ORIGIN, bounds.size(), palette.background);
+        let mut layers = Vec::with_capacity(6);
+        layers.push(background.into_geometry());
+        if let (Some(profiles), Some(projection)) = (&self.profiles, projection) {
+            layers.push(profiles.draw(renderer, bounds.size(), projection, palette));
+        }
         layers.push(base);
         if let (Some(drawings), Some(projection)) = (&self.drawings, projection) {
             let local = cursor
@@ -935,6 +1179,28 @@ impl canvas::Program<Message> for Chart<'_> {
             bounds.size(),
             axis_width(self.data, self.quote, self.volume_unit),
         );
+        if state.profile_claim.is_some() {
+            return mouse::Interaction::Grabbing;
+        }
+        if let Some(drawings) = &self.drawings
+            && let Some(claim) = state
+                .drawing_claim
+                .filter(|claim| claim.generation == drawings.interaction.generation())
+        {
+            return if drawings.interaction.tool() != Tool::Select {
+                mouse::Interaction::Crosshair
+            } else {
+                claim
+                    .hit
+                    .and_then(|hit| {
+                        drawings
+                            .store
+                            .find(hit.id)
+                            .map(|drawing| drawing_cursor(drawing, hit.part, true))
+                    })
+                    .unwrap_or(mouse::Interaction::Grabbing)
+            };
+        }
         if !state.space_pan
             && state.drag.is_none()
             && let Some(drawings) = &self.drawings
@@ -942,29 +1208,40 @@ impl canvas::Program<Message> for Chart<'_> {
                 .data
                 .latest()
                 .and_then(|_| Projection::new(self.data.viewport, area))
+            && let Some(point) = cursor.position_in(bounds)
+            && projection.contains(point)
         {
-            if drawings.interaction.is_dragging() {
-                return mouse::Interaction::Grabbing;
+            if drawings.interaction.tool() != Tool::Select {
+                return mouse::Interaction::Crosshair;
             }
-            if let Some(point) = cursor.position_in(bounds)
-                && projection.contains(point)
+            if let Some(hit) = drawing_geometry::hit_test_cached(
+                drawings.store.objects(),
+                drawings.store.selected(),
+                projection,
+                point,
+                Some(drawings.store),
+            ) && let Some(drawing) = drawings.store.find(hit.id)
             {
-                if drawings.interaction.tool() != Tool::Select {
-                    return mouse::Interaction::Crosshair;
-                }
-                if let Some(hit) = drawing_geometry::hit_test(
-                    drawings.store.objects(),
-                    drawings.store.selected(),
-                    projection,
-                    point,
-                ) {
-                    return if hit.part == crate::drawing_types::Part::Body {
-                        mouse::Interaction::Pointer
-                    } else {
-                        mouse::Interaction::Crosshair
-                    };
-                }
+                return drawing_cursor(drawing, hit.part, false);
             }
+        }
+        if !state.space_pan
+            && state.drag.is_none()
+            && let (Some(profiles), Some(point), Some(projection)) = (
+                &self.profiles,
+                cursor.position_in(bounds),
+                self.data
+                    .latest()
+                    .and_then(|_| Projection::new(self.data.viewport, area)),
+            )
+            && projection.contains(point)
+            && let Some(hit) = profiles.hit_range(projection, point)
+        {
+            return if matches!(hit.part, profile_layer::RangePart::Body) {
+                mouse::Interaction::Grab
+            } else {
+                mouse::Interaction::ResizingHorizontally
+            };
         }
         let region = state
             .drag
@@ -973,6 +1250,9 @@ impl canvas::Program<Message> for Chart<'_> {
         match region {
             Some(Region::PriceAxis) => mouse::Interaction::ResizingVertically,
             Some(Region::TimeAxis) => mouse::Interaction::ResizingHorizontally,
+            Some(Region::Plot) if state.space_pan && state.drag.is_none() => {
+                mouse::Interaction::Grab
+            }
             Some(Region::Plot) if state.drag.is_some() => mouse::Interaction::Grabbing,
             Some(Region::Plot) => mouse::Interaction::Crosshair,
             None => mouse::Interaction::default(),
@@ -1114,6 +1394,19 @@ impl Chart<'_> {
                 continue;
             }
             let cvd = matches!(instance.spec, IndicatorSpec::Cvd { .. });
+            let vwap = matches!(instance.spec, IndicatorSpec::Vwap { .. });
+            let segmented = cvd || vwap;
+            let point_origin = |index| {
+                if cvd {
+                    instance.cvd_context(index).map(|context| context.origin)
+                } else if vwap {
+                    instance
+                        .vwap_context(index)
+                        .map(|context| context.origin_ms)
+                } else {
+                    None
+                }
+            };
             let point_start = points
                 .first()
                 .and_then(|first| {
@@ -1124,15 +1417,18 @@ impl Chart<'_> {
                 })
                 .unwrap_or(0);
             let path = Path::new(|builder| {
-                let mut previous = None;
+                let mut previous: Option<(f64, f64)> = None;
                 let mut previous_origin = None;
                 let mut last_end = None;
                 for (offset, point) in points.iter().enumerate() {
-                    let origin = cvd
-                        .then(|| instance.cvd_context(point_start + offset).map(|c| c.origin))
-                        .flatten();
+                    let origin = point_origin(point_start + offset);
                     if let Some(value) = point.values[series].filter(|value| value.is_finite()) {
-                        if cvd && (origin.is_none() || previous_origin != origin) {
+                        if (segmented && (origin.is_none() || previous_origin != origin))
+                            || (vwap
+                                && previous.is_some_and(|(time, _)| {
+                                    point.time as f64 != time + self.data.step()
+                                }))
+                        {
                             previous = None;
                             last_end = None;
                         }
@@ -1169,21 +1465,22 @@ impl Chart<'_> {
             });
             let segments = dash(instance.id, series);
             frame.stroke(&path, series_stroke(color, &segments));
-            if cvd {
+            if segmented {
                 // A proven origin/reset can contain one point and no line segment.
                 for (index, point) in points.iter().enumerate() {
                     let Some(value) = point.values[series].filter(|value| value.is_finite()) else {
                         continue;
                     };
-                    let Some(context) = instance.cvd_context(point_start + index) else {
+                    let Some(origin) = point_origin(point_start + index) else {
                         continue;
                     };
                     let connected = |other: usize| {
-                        points.get(other).is_some_and(|point| {
-                            point.values[series].is_some_and(f64::is_finite)
-                                && instance
-                                    .cvd_context(point_start + other)
-                                    .is_some_and(|other| other.origin == context.origin)
+                        points.get(other).is_some_and(|other_point| {
+                            other_point.values[series].is_some_and(f64::is_finite)
+                                && point_origin(point_start + other) == Some(origin)
+                                && (!vwap
+                                    || (other_point.time as f64 - point.time as f64).abs()
+                                        == self.data.step())
                         })
                     };
                     let isolated = (index == 0 || !connected(index - 1)) && !connected(index + 1);
@@ -1294,7 +1591,7 @@ impl Chart<'_> {
             frame.with_clip(Rectangle::with_size(bounds.size()), |frame| {
                 frame.fill_rectangle(Point::ORIGIN, bounds.size(), palette.background);
                 let grid = Color {
-                    a: 0.3,
+                    a: 0.16,
                     ..palette.muted
                 };
                 let has_values = if instance.spec == IndicatorSpec::OpenInterest {
@@ -1489,7 +1786,7 @@ impl Chart<'_> {
     }
 }
 
-const LEGEND_HEADER_HEIGHT: f32 = 26.0;
+const LEGEND_HEADER_HEIGHT: f32 = 28.0;
 
 /// Nominal height at ordinary widths; wrapping may grow the actual widget.
 /// Contributor count never affects the permanent legend footprint.
@@ -1502,6 +1799,8 @@ pub fn legend_height(instance: &IndicatorInstance) -> f32 {
             IndicatorSpec::Cvd { .. } | IndicatorSpec::OpenInterest
         ) {
             82.0
+        } else if matches!(instance.spec, IndicatorSpec::Vwap { .. }) {
+            42.0
         } else {
             22.0
         }
@@ -1602,7 +1901,7 @@ fn observation_age(data: &ChartState, sample: &OpenInterestSample) -> String {
 
 fn summary_line<'a>(content: impl Into<String>, color: Color) -> Element<'a, Message> {
     text(content.into())
-        .size(11)
+        .size(10)
         .color(color)
         .width(Length::Fill)
         .into()
@@ -1675,6 +1974,8 @@ fn indicator_summary_view<'a>(
                     || {
                         if matches!(instance.spec, IndicatorSpec::Cvd { .. }) {
                             format!("-- {unit} (incomplete)")
+                        } else if matches!(instance.spec, IndicatorSpec::Vwap { .. }) {
+                            "-- (no eligible volume)".into()
                         } else {
                             "-- (warming up)".into()
                         }
@@ -1720,16 +2021,46 @@ fn indicator_summary_view<'a>(
         } else {
             "incomplete"
         };
-        let mode = match (inspecting, instance.source.is_chart()) {
-            (None, true) => "Current".to_owned(),
-            (None, false) => format!("Current · current sources {coverage}"),
-            (Some(time), true) => format!("Historical inspection · {}", utc_ms(time)),
-            (Some(time), false) => format!(
-                "Historical inspection · {} · current sources {coverage}",
-                utc_ms(time)
-            ),
-        };
-        body = body.push(summary_line(mode, palette.foreground));
+        let mut context = row![ui::badge(
+            if inspecting.is_some() {
+                "Historical"
+            } else {
+                "Current"
+            },
+            ui::Tone::Accent,
+        )]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        if let Some(time) = inspecting {
+            context = context.push(text(utc_ms(time)).size(10).color(palette.muted));
+        }
+        if !instance.source.is_chart() {
+            context = context.push(ui::badge(
+                format!("Current sources {coverage}"),
+                if coverage == "complete" {
+                    ui::Tone::Positive
+                } else {
+                    ui::Tone::Negative
+                },
+            ));
+        } else if instance.spec == IndicatorSpec::OpenInterest && !exact {
+            let unsupported = data.market.product == Product::Spot
+                || data.open_interest.support.as_ref().is_some_and(|support| {
+                    support.live_interval_ms.is_none() && support.history_interval_ms.is_none()
+                });
+            let (status, tone) = if unsupported {
+                ("OI unsupported", ui::Tone::Neutral)
+            } else if data.open_interest.connected {
+                ("OI live", ui::Tone::Positive)
+            } else {
+                ("OI offline", ui::Tone::Negative)
+            };
+            context = context.push(ui::hint(
+                ui::badge(status, tone),
+                open_interest_status(data),
+            ));
+        }
+        body = body.push(context.width(Length::Fill).wrap());
     }
     if matches!(instance.spec, IndicatorSpec::Cvd { .. }) {
         let provenance = point_index
@@ -1750,7 +2081,25 @@ fn indicator_summary_view<'a>(
                     )
                 },
             );
-        body = body.push(summary_line(provenance, palette.foreground));
+        body = body.push(summary_line(provenance, palette.muted));
+    } else if matches!(instance.spec, IndicatorSpec::Vwap { .. }) {
+        let provenance = point_index
+            .and_then(|index| instance.vwap_context(index))
+            .map_or_else(
+                || "Candle HLC3 · no eligible session / origin".into(),
+                |context| {
+                    format!(
+                        "Candle HLC3 · {} · origin {}",
+                        if context.covered {
+                            "covered window"
+                        } else {
+                            "Partial history"
+                        },
+                        utc_ms(context.origin_ms)
+                    )
+                },
+            );
+        body = body.push(summary_line(provenance, palette.muted));
     } else if instance.spec == IndicatorSpec::OpenInterest {
         let provenance = data.inspected_open_interest_for(instance).map_or_else(
             || "No actual observation at this time".into(),
@@ -1762,53 +2111,145 @@ fn indicator_summary_view<'a>(
                 )
             },
         );
-        body = body.push(summary_line(provenance, palette.foreground));
-        if instance.source.is_chart() {
-            body = body.push(summary_line(open_interest_status(data), palette.foreground));
+        body = body.push(summary_line(provenance, palette.muted));
+        if instance.source.is_chart() && exact {
+            body = body.push(summary_line(open_interest_status(data), palette.muted));
         }
     }
     if !instance.source.is_chart() {
         body = body.push(summary_line(
             asof_range_label(source_asof_range(data, instance, point_index)),
-            palette.foreground,
+            palette.muted,
         ));
         if instance.spec == IndicatorSpec::OpenInterest {
             body = body.push(summary_line(
                 "Not an exact simultaneous snapshot",
-                palette.foreground,
+                palette.muted,
             ));
         }
     }
     body.into()
 }
 
+fn contributor_asof(contributor: &ContributorHealth, now_ms: i64) -> String {
+    let provenance = match contributor.timestamp_source {
+        Some(OpenInterestTimestamp::Venue) => "Native venue as-of",
+        Some(OpenInterestTimestamp::Observed) => "Locally observed",
+        None => "Native coverage through",
+    };
+    contributor.asof_ms.map_or_else(
+        || format!("{provenance} unavailable"),
+        |asof| {
+            let age = if asof > now_ms {
+                "ahead of reference clock".into()
+            } else {
+                format!("age {:.1} s", now_ms.saturating_sub(asof) as f64 / 1000.0)
+            };
+            format!("{provenance} {} · {age}", utc_ms(asof))
+        },
+    )
+}
+
+fn condition_label(condition: SourceCondition) -> &'static str {
+    match condition {
+        SourceCondition::Disconnected => "Current: disconnected",
+        SourceCondition::MissingObservation => "Current: missing observation",
+        SourceCondition::Stale => "Current: stale",
+        SourceCondition::IncompleteCoverage => "Current: incomplete coverage",
+        SourceCondition::Current => "Current: native coverage",
+    }
+}
+
 fn source_problem_view<'a>(
     id: u64,
-    problem: String,
+    problem: &SourceBlocker,
+    health: &SourceHealth,
     palette: Palette,
     blocked: bool,
 ) -> Element<'a, Message> {
     let action = |label: &'static str, message| {
         button(text(label).size(11))
-            .style(button::secondary)
-            .padding([3, 6])
+            .style(ui::quiet)
+            .padding([3, 7])
             .on_press_maybe((!blocked).then_some(message))
     };
-    column![
-        summary_line(
-            format!("Source needs attention: {problem}"),
-            palette.foreground
-        ),
-        row![
-            action("Repair source", Message::IndicatorSettings(id)),
-            action("Use Chart", Message::UseChartSource(id)),
-        ]
-        .spacing(4)
-        .wrap(),
+    let (label, tone) = match problem.kind {
+        BlockerKind::DiscoveryPending(_, _) | BlockerKind::DiscoveryMissing(_, _) => {
+            ("Discovery pending", ui::Tone::Neutral)
+        }
+        BlockerKind::DiscoveryFailed(_, _) => ("Discovery failed", ui::Tone::Negative),
+        BlockerKind::MissingMembership(_, _) => ("Required choice missing", ui::Tone::Negative),
+        BlockerKind::NativeEligibility | BlockerKind::IdentityMismatch => {
+            ("Source incompatible", ui::Tone::Negative)
+        }
+        BlockerKind::MetadataPending | BlockerKind::MissingInput => {
+            ("Input pending", ui::Tone::Neutral)
+        }
+        BlockerKind::AggregateCoverage => ("Coverage incomplete", ui::Tone::Negative),
+        BlockerKind::Contributor(condition) => match condition {
+            mexc_indicators::SourceCondition::Disconnected => ("Disconnected", ui::Tone::Negative),
+            mexc_indicators::SourceCondition::MissingObservation => {
+                ("No observation", ui::Tone::Neutral)
+            }
+            mexc_indicators::SourceCondition::Stale => ("Stale", ui::Tone::Negative),
+            mexc_indicators::SourceCondition::IncompleteCoverage => {
+                ("Coverage incomplete", ui::Tone::Negative)
+            }
+            mexc_indicators::SourceCondition::Current => ("Current", ui::Tone::Positive),
+        },
+    };
+    let mut body = column![
+        ui::badge(format!("Current · {label}"), tone),
+        summary_line(&problem.message, palette.foreground),
     ]
     .spacing(3)
-    .width(Length::Fill)
-    .into()
+    .width(Length::Fill);
+    let mut actions = Row::new().spacing(4);
+    match &problem.remedy {
+        Remedy::Retry(market) => {
+            if let Some(contributor) = health
+                .contributors
+                .iter()
+                .find(|item| item.market == *market)
+            {
+                body = body.push(summary_line(
+                    contributor_asof(contributor, health.now_ms),
+                    palette.muted,
+                ));
+            }
+            actions = actions.push(action(
+                "Retry contributor",
+                Message::RetryContributor {
+                    id,
+                    market: market.clone(),
+                },
+            ));
+        }
+        Remedy::Discovery(exchange, product) => {
+            actions = actions.push(action(
+                "Retry discovery",
+                Message::RetrySourceDiscovery {
+                    id,
+                    exchange: *exchange,
+                    product: *product,
+                },
+            ));
+        }
+        Remedy::Repair => {
+            actions = actions.push(action("Repair source", Message::IndicatorSettings(id)));
+        }
+        Remedy::Wait => {
+            body = body.push(summary_line(
+                "Awaiting native metadata / discovery; current completeness is not established.",
+                palette.muted,
+            ));
+        }
+    }
+    if problem.remedy != Remedy::Wait {
+        actions = actions.push(action("Use Chart", Message::UseChartSource(id)));
+        body = body.push(actions.wrap());
+    }
+    body.into()
 }
 
 pub fn legend_view<'a>(
@@ -1817,7 +2258,7 @@ pub fn legend_view<'a>(
     palette: Palette,
     volume_unit: &'a str,
     help_open: bool,
-    source_problem: Option<String>,
+    health: SourceHealth,
 ) -> Element<'a, Message> {
     let target = if !instance.spec.is_overlay() && data.active_pane == Some(instance.id) {
         " · scale target"
@@ -1843,14 +2284,19 @@ pub fn legend_view<'a>(
             .line_height(text::LineHeight::Absolute(20.0.into()))
             .color(palette.foreground),
     )
-    .style(button::text)
-    .padding([3, 2])
+    .style(ui::quiet)
+    .padding([2, 3])
     .on_press_maybe((!help_open).then_some(activate.clone()));
     let control = |label: &'static str, message| {
+        let style = if label == "Remove" {
+            ui::danger
+        } else {
+            ui::quiet
+        };
         button(text(label).size(11))
-            .style(button::text)
-            .padding([3, 6])
-            .height(LEGEND_HEADER_HEIGHT)
+            .style(style)
+            .padding([2, 5])
+            .height(24)
             .on_press_maybe((!help_open).then_some(message))
     };
     // Local controls remain siblings of the pane activation target.
@@ -1897,10 +2343,11 @@ pub fn legend_view<'a>(
             .interaction(mouse::Interaction::Pointer)
     };
     let mut legend = column![header, summary].spacing(3).width(Length::Fill);
-    if let Some(problem) = source_problem {
+    if let Some(problem) = health.blockers.first() {
         legend = legend.push(source_problem_view(
             instance.id,
             problem,
+            &health,
             palette,
             help_open,
         ));
@@ -1914,22 +2361,30 @@ pub fn indicator_details_view<'a>(
     instance: &'a IndicatorInstance,
     palette: Palette,
     volume_unit: &'a str,
-    source_problem: Option<String>,
+    health: SourceHealth,
 ) -> Element<'a, Message> {
     let mut details = column![
         indicator_summary_view(data, instance, palette, volume_unit, true),
-        text("Source and coverage")
-            .size(14)
-            .color(palette.foreground),
-        summary_line(
-            format!("Source mode: {}", instance.source.mode),
-            palette.foreground
-        ),
+        text("Source and coverage").size(14).style(ui::accent_text),
+        ui::badge(format!("{} source", instance.source.mode), ui::Tone::Accent),
     ]
     .spacing(8)
     .width(Length::Fill);
-    if let Some(problem) = source_problem {
-        details = details.push(source_problem_view(instance.id, problem, palette, false));
+    if matches!(instance.spec, IndicatorSpec::Vwap { .. }) {
+        details = details
+            .push(summary_line(
+                format!("Candle VWAP = Σ(HLC3 × native volume) / Σ(native volume). {} candles; weights in {}. This is not priced-execution VWAP; changing the native interval can change the approximation.", data.market.interval, volume_unit),
+                palette.foreground))
+            .push(summary_line("UTC day/week/month or IANA-local daily sessions. Candles crossing a session boundary are excluded rather than split. Missing origin or interior bars remain Partial; zero total volume has no VWAP value.", palette.muted));
+    }
+    for problem in &health.blockers {
+        details = details.push(source_problem_view(
+            instance.id,
+            problem,
+            &health,
+            palette,
+            false,
+        ));
     }
     if !instance.source.is_chart() {
         let output = instance.external.as_ref();
@@ -1942,6 +2397,10 @@ pub fn indicator_details_view<'a>(
         details = details.push(summary_line(
             "Every source is required. Totals are not an exact simultaneous snapshot.",
             palette.foreground,
+        ));
+        details = details.push(summary_line(
+            "Contributor health is current. Proven historical values do not resolve current blockers.",
+            palette.muted,
         ));
         if matches!(instance.spec, IndicatorSpec::Cvd { .. }) {
             details = details.push(summary_line(
@@ -1961,49 +2420,62 @@ pub fn indicator_details_view<'a>(
             ),
             palette.foreground,
         ));
-        if !output.is_some_and(|output| output.complete) {
+        if health
+            .blockers
+            .iter()
+            .any(|blocker| matches!(blocker.remedy, Remedy::Retry(_) | Remedy::Discovery(..)))
+        {
             details = details.push(
-                button(text("Retry sources").size(12))
-                    .style(button::secondary)
+                button(text("Retry blocked sources").size(12))
+                    .style(ui::quiet)
                     .on_press(Message::RetryIndicatorSources(instance.id)),
             );
         }
-        details = details.push(text("Contributors").size(14).color(palette.foreground));
+        details = details.push(text("Contributors").size(14).style(ui::accent_text));
         for market in &instance.source.markets {
-            let contributor = output.and_then(|output| {
-                output.contributors.iter().find(|item| {
-                    item.market.exchange == market.exchange
-                        && item.market.product == market.product
-                        && item.market.symbol == market.symbol
-                })
+            let contributor = health.contributors.iter().find(|item| {
+                item.market.exchange == market.exchange
+                    && item.market.product == market.product
+                    && item.market.symbol == market.symbol
+                    && item.market.interval == data.market.interval
             });
             details = details.push(
                 column![
-                    summary_line(
-                        format!(
-                            "{} · {} · {} · {} · {}",
-                            market.exchange,
-                            market.product,
-                            market.symbol,
-                            data.market.interval,
-                            if contributor.is_some_and(|item| item.complete) {
-                                "covered"
+                    text(&market.symbol).size(13).font(iced::Font::MONOSPACE),
+                    row![
+                        ui::badge(market.exchange.to_string(), ui::Tone::Neutral),
+                        ui::badge(market.product.to_string(), ui::Tone::Accent),
+                        ui::badge(data.market.interval.to_string(), ui::Tone::Neutral),
+                        ui::badge(
+                            contributor.map_or("Current: awaiting metadata", |item| {
+                                if item.validated {
+                                    condition_label(item.condition)
+                                } else {
+                                    "Current: awaiting native validation"
+                                }
+                            }),
+                            if contributor
+                                .is_some_and(|item| item.validated
+                                    && item.condition == SourceCondition::Current)
+                            {
+                                ui::Tone::Positive
                             } else {
-                                "incomplete"
+                                ui::Tone::Negative
                             },
+                        ),
+                    ]
+                    .spacing(5)
+                    .wrap(),
+                    summary_line(
+                        contributor.map_or_else(
+                            || "Current native source as-of unavailable".into(),
+                            |item| contributor_asof(item, health.now_ms),
                         ),
                         palette.foreground,
                     ),
                     summary_line(
-                        contributor.map_or_else(
-                            || "Awaiting catalog / source data · as-of unavailable".into(),
-                            |item| format!(
-                                "As-of {} · {}",
-                                item.through_ms.map_or_else(|| "unavailable".into(), utc_ms),
-                                item.message,
-                            ),
-                        ),
-                        palette.foreground,
+                        contributor.map_or("No raw source status", |item| item.raw_status.as_str()),
+                        palette.muted,
                     ),
                 ]
                 .spacing(3)
@@ -2024,7 +2496,6 @@ pub fn indicator_details_view<'a>(
         ));
         if instance.spec == IndicatorSpec::OpenInterest {
             let native = &data.open_interest;
-            details = details.push(summary_line(open_interest_status(data), palette.foreground));
             if let Some(support) = &native.support {
                 let cadence = |interval: Option<i64>| {
                     interval.map_or_else(
@@ -2047,9 +2518,6 @@ pub fn indicator_details_view<'a>(
                     "Native history / live cadence: awaiting source support",
                     palette.foreground,
                 ));
-            }
-            if !native.message.is_empty() {
-                details = details.push(summary_line(&native.message, palette.foreground));
             }
             if let Some(sample) = data.inspected_open_interest_for(instance) {
                 details = details.push(summary_line(
@@ -2130,13 +2598,108 @@ mod tests {
         assert!(oi_segment_contiguous(instance, &after, &recovered));
     }
 
-    fn lower_state() -> ChartState {
+    pub(super) fn lower_state() -> ChartState {
         let mut data = ChartState::default();
         data.dispatch(Action::AddIndicator(IndicatorSpec::Rsi { period: 2 }));
         data
     }
 
-    fn input(
+    #[test]
+    fn anchored_curve_cursor_matches_its_cached_pick_geometry_and_edit_capability() {
+        use crate::drawing_types::{Command, Shape, Style};
+        let mut data = ChartState::default();
+        for (time, price) in [(0, 10.0), (300, 30.0), (600, 50.0)] {
+            data.merge_stream(mexc_model::Candle {
+                time,
+                open: price,
+                high: price,
+                low: price,
+                close: price,
+                volume: 1.0,
+                flow: None,
+            });
+        }
+        data.viewport.left = 0.0;
+        data.viewport.span = 600.0;
+        data.viewport.low = 0.0;
+        data.viewport.high = 40.0;
+        data.viewport.auto_fit = false;
+        data.viewport.live = false;
+        let mut store = crate::drawings::Store::new(&data.market);
+        store
+            .apply(Command::Create {
+                shape: Shape::AnchoredVwap(Anchor {
+                    utc_ms: 0,
+                    price: 0.0,
+                }),
+                style: Style::default(),
+            })
+            .unwrap();
+        store.sync_vwap_preview(data.candles(), data.market.interval, Some(0), None);
+        let drawing_interaction = crate::drawing_interaction::Interaction::default();
+        let scene = drawing_layer::Scene::default();
+        let projection_cell = std::cell::Cell::new(None);
+        let cache = Cache::default();
+        let chart = Chart {
+            data: &data,
+            cache: &cache,
+            palette: Palette::default(),
+            indicator: None,
+            quote: "USDC",
+            volume_unit: "contracts",
+            drawings: Some(drawing_layer::View {
+                store: &store,
+                interaction: &drawing_interaction,
+                scene: &scene,
+                projection: &projection_cell,
+                native_candles: data.candles(),
+            }),
+            profiles: None,
+            profile_range: None,
+            metrics: None,
+        };
+        let bounds = Rectangle::with_size(Size::new(
+            400.0 + axis_width(&data, "USDC", "contracts"),
+            242.0,
+        ));
+        let projection = Projection::new(
+            data.viewport,
+            plot(bounds.size(), axis_width(&data, "USDC", "contracts")),
+        )
+        .unwrap();
+        for (anchor, hover, held) in [
+            (
+                Anchor {
+                    utc_ms: 150_000,
+                    price: 15.0,
+                },
+                mouse::Interaction::Pointer,
+                mouse::Interaction::Pointer,
+            ),
+            (
+                Anchor {
+                    utc_ms: 0,
+                    price: 10.0,
+                },
+                mouse::Interaction::Crosshair,
+                mouse::Interaction::Grabbing,
+            ),
+        ] {
+            let mut interaction = Interaction::default();
+            let cursor = mouse::Cursor::Available(projection.point(anchor));
+            assert_eq!(chart.mouse_interaction(&interaction, bounds, cursor), hover);
+            let (status, _) = chart.update(
+                &mut interaction,
+                canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                bounds,
+                cursor,
+            );
+            assert_eq!(status, canvas::event::Status::Captured);
+            assert_eq!(chart.mouse_interaction(&interaction, bounds, cursor), held);
+        }
+    }
+
+    pub(super) fn input(
         data: &ChartState,
         interaction: &mut Interaction,
         point: Point,
@@ -2151,6 +2714,9 @@ mod tests {
             quote: "USDT",
             volume_unit: "base",
             drawings: None,
+            profiles: None,
+            profile_range: None,
+            metrics: None,
         };
         let (_, message) = chart.update(
             interaction,
@@ -2351,6 +2917,9 @@ mod tests {
             quote: "USDC",
             volume_unit: "contracts",
             drawings: None,
+            profiles: None,
+            profile_range: None,
+            metrics: None,
         };
         assert_eq!(chart.price_tick_label(0.000000123, 1e-9), "0.000000123");
         assert_eq!(chart.price_tick_label(12_000.0, 1000.0), "12000");
@@ -2431,3 +3000,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "chart_input_tests.rs"]
+mod input_tests;

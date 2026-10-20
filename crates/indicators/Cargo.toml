@@ -2,6 +2,10 @@
 name = "mexc-indicators"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 mexc-model.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+rust_decimal.workspace = true

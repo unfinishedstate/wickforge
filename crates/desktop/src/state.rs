@@ -1,3 +1,7 @@
+use crate::workspace::{
+    SavedChart, SavedIndicator, SavedPane, SavedProfile, SavedScale, SavedView,
+};
+use mexc_indicators::profiles::Instance as ProfileInstance;
 use mexc_indicators::{
     IndicatorInstance, IndicatorSet, IndicatorSource, IndicatorSpec, SourceData,
 };
@@ -6,6 +10,9 @@ use mexc_model::{
     Product, Timeframe, VolumeFlow,
 };
 use std::collections::{BTreeMap, HashMap};
+
+pub(crate) const MIN_VISIBLE_BARS: f64 = 10.0;
+pub(crate) const MAX_VISIBLE_BARS: f64 = 10000.0;
 
 /// Input adapters only translate into these renderer-independent commands.
 #[derive(Debug, Clone)]
@@ -34,6 +41,13 @@ pub enum Action {
     },
     FitPane(u64),
     ActivatePane(Option<u64>),
+    /// Swap with the adjacent visible lower pane; sign selects up/down.
+    MovePane {
+        id: u64,
+        direction: i32,
+    },
+    /// `None` targets price; the same target again restores the saved layout.
+    TogglePaneMaximized(Option<u64>),
     SetPaneHeight {
         id: Option<u64>,
         height: f32,
@@ -52,6 +66,8 @@ pub enum Action {
     AutoFit,
     Live,
     Inspect(Option<(f64, f64)>),
+    /// Center the time viewport at UTC epoch seconds without selecting a bar.
+    GotoTime(i64),
     InspectStep(i32),
     Older,
     Retry,
@@ -158,7 +174,7 @@ impl PaneScale {
     }
 }
 
-/// Session presentation only: independent of feeds, numerical scales and visibility.
+/// Durable presentation only: independent of feeds, numerical scales and visibility.
 #[derive(Debug, Clone, Copy)]
 struct PaneLayout {
     height: f32,
@@ -174,7 +190,7 @@ impl Default for PaneLayout {
     }
 }
 
-fn default_plot_height(id: Option<u64>) -> f32 {
+pub(crate) fn default_plot_height(id: Option<u64>) -> f32 {
     if id.is_some() { 190.0 } else { 340.0 }
 }
 
@@ -261,15 +277,19 @@ pub struct ChartState {
     // Contiguous chronological storage lets calculations borrow candles without
     // cloning the entire history on each live tick.
     candles: Vec<Candle>,
+    candle_dirty_from: Option<usize>,
     stream_epochs: BTreeMap<i64, u64>,
     pending_flow: BTreeMap<i64, (VolumeFlow, FlowSource)>,
     pub indicators: IndicatorSet,
+    pub profiles: Vec<ProfileInstance>,
     pub open_interest: OpenInterestState,
     pub indicator_error: Option<String>,
     pub viewport: Viewport,
     pub pane_scales: BTreeMap<u64, PaneScale>,
     price_plot_height: f32,
     pane_layouts: BTreeMap<u64, PaneLayout>,
+    // Outer None is normal layout; Some(None) maximizes the price pane.
+    maximized_pane: Option<Option<u64>>,
     pub active_pane: Option<u64>,
     pub inspection: Option<(i64, f64)>,
     // Native inspection retains sub-second source timestamps independently of candles.
@@ -286,15 +306,18 @@ impl Default for ChartState {
             price_scale: 1,
             base_asset: "BTC".into(),
             candles: Vec::new(),
+            candle_dirty_from: Some(0),
             stream_epochs: BTreeMap::new(),
             pending_flow: BTreeMap::new(),
             indicators: IndicatorSet::default(),
+            profiles: Vec::new(),
             open_interest: OpenInterestState::default(),
             indicator_error: None,
             viewport: Viewport::default(),
             pane_scales: BTreeMap::new(),
             price_plot_height: default_plot_height(None),
             pane_layouts: BTreeMap::new(),
+            maximized_pane: None,
             active_pane: None,
             inspection: None,
             native_inspection_ms: None,
@@ -306,6 +329,116 @@ impl Default for ChartState {
 }
 
 impl ChartState {
+    /// Capture committed configuration only; no history or numerical output is cloned.
+    pub fn workspace_snapshot(&self) -> SavedChart {
+        SavedChart {
+            market: (&self.market).into(),
+            indicators: self
+                .indicators
+                .instances
+                .iter()
+                .map(|instance| SavedIndicator {
+                    id: instance.id,
+                    spec: instance.spec.into(),
+                    source: (&instance.source).into(),
+                    visible: instance.visible,
+                })
+                .collect(),
+            profiles: self.profiles.iter().map(SavedProfile::from).collect(),
+            view: self.viewport.into(),
+            price_height: self.price_plot_height,
+            panes: self
+                .indicators
+                .instances
+                .iter()
+                .filter(|instance| !instance.spec.is_overlay())
+                .map(|instance| {
+                    let layout = self
+                        .pane_layouts
+                        .get(&instance.id)
+                        .copied()
+                        .unwrap_or_default();
+                    let scale = self.pane_scale(instance.id);
+                    SavedPane {
+                        id: instance.id,
+                        height: layout.height,
+                        collapsed: layout.collapsed,
+                        scale: SavedScale::from_bounds(scale.auto_fit, scale.low, scale.high),
+                    }
+                })
+                .collect(),
+            active_pane: self.active_pane,
+        }
+    }
+
+    /// Validate and construct the replacement before changing any runtime state.
+    pub fn restore_workspace(&mut self, saved: &SavedChart) -> Result<(), String> {
+        saved.validate()?;
+        let market = saved.market.to_market()?;
+        let mut restored = Self::default();
+        // Catalog precision/base metadata is intentionally not a durable setting.
+        // Preserve metadata only when restoring this exact instrument.
+        if self.market.exchange == market.exchange
+            && self.market.product == market.product
+            && self.market.symbol == market.symbol
+        {
+            restored.price_scale = self.price_scale;
+            restored.base_asset = self.base_asset.clone();
+        } else {
+            restored.base_asset.clear();
+        }
+        restored.market = market;
+        for indicator in &saved.indicators {
+            let spec = indicator.spec.to_spec()?;
+            restored.indicators.restore_instance(
+                indicator.id,
+                spec,
+                indicator.source.to_source(spec)?,
+                indicator.visible,
+            )?;
+        }
+        restored.profiles = saved
+            .profiles
+            .iter()
+            .map(SavedProfile::to_instance)
+            .collect::<Result<_, _>>()?;
+        restored.price_plot_height = saved.price_height;
+        for pane in &saved.panes {
+            restored.pane_layouts.insert(
+                pane.id,
+                PaneLayout {
+                    height: pane.height,
+                    collapsed: pane.collapsed,
+                },
+            );
+            restored
+                .pane_scales
+                .insert(pane.id, pane.scale.to_pane_scale());
+        }
+        restored.active_pane = saved.active_pane;
+        restored.reapply_workspace_view(&saved.view)?;
+        *self = restored;
+        Ok(())
+    }
+
+    /// Reapply after native initialization if a controller has selected the market.
+    /// This never refits a manual scale or overwrites restored pane presentation.
+    pub fn reapply_workspace_view(&mut self, saved: &SavedView) -> Result<(), String> {
+        saved.validate(self.market.interval)?;
+        self.viewport.live = saved.live;
+        self.viewport.span = saved.span;
+        if let Some(left) = saved.left {
+            self.viewport.left = left;
+        }
+        self.viewport.auto_fit = saved.price_scale.auto_fit;
+        if let (Some(low), Some(high)) = (saved.price_scale.low, saved.price_scale.high) {
+            self.viewport.low = low;
+            self.viewport.high = high;
+        }
+        self.refresh_view();
+        Ok(())
+    }
+
     pub fn step(&self) -> f64 {
         self.market.interval.seconds() as f64
     }
@@ -328,9 +461,11 @@ impl ChartState {
         self.viewport = Viewport::for_timeframe(market.interval);
         self.pane_scales.clear();
         self.active_pane = None;
+        self.maximized_pane = None;
         self.market = market;
         self.price_scale = price_scale;
         self.candles.clear();
+        self.candle_dirty_from = Some(0);
         self.stream_epochs.clear();
         self.pending_flow.clear();
         if !same_instrument {
@@ -362,6 +497,20 @@ impl ChartState {
 
     pub fn len(&self) -> usize {
         self.candles.len()
+    }
+
+    /// Borrow the complete native timeline without copying for drawings and diagnostics.
+    pub fn candles(&self) -> &[Candle] {
+        &self.candles
+    }
+
+    /// Accumulate every native price/volume change until derived drawings consume it.
+    pub fn take_candle_dirty_from(&mut self) -> Option<usize> {
+        self.candle_dirty_from.take()
+    }
+
+    fn mark_candles_dirty(&mut self, from: usize) {
+        self.candle_dirty_from = Some(self.candle_dirty_from.map_or(from, |old| old.min(from)));
     }
 
     pub fn visible(&self) -> impl Iterator<Item = &Candle> {
@@ -603,6 +752,7 @@ impl ChartState {
                 }
             };
         if price_changed {
+            self.mark_candles_dirty(index);
             self.indicators
                 .recalculate(&self.candles, index, self.market.interval);
         } else if flow_changed {
@@ -811,6 +961,7 @@ impl ChartState {
             let from = self
                 .candles
                 .partition_point(|c| c.time < price_changed_time.min(flow_changed_time));
+            self.mark_candles_dirty(from);
             self.indicators
                 .recalculate(&self.candles, from, self.market.interval);
         } else if flow_changed_time != i64::MAX {
@@ -820,8 +971,9 @@ impl ChartState {
         }
         if !self.initialized && !self.candles.is_empty() {
             self.initialized = true;
-            self.follow_latest();
         }
+        // refresh_view follows only in live mode, preserving jumps made while
+        // the first native history request was still in flight.
         self.refresh_view();
     }
 
@@ -880,6 +1032,22 @@ impl ChartState {
         self.pane_scales.get(&id).copied().unwrap_or_default()
     }
 
+    /// Invalidated targets recover to normal layout even after direct model edits.
+    pub fn maximized_target(&self) -> Option<Option<u64>> {
+        self.maximized_pane
+            .filter(|target| target.is_none_or(|id| self.visible_lower_pane(id)))
+    }
+
+    pub fn maximized(&self) -> bool {
+        self.maximized_target().is_some()
+    }
+
+    /// Price is `None`; hidden indicators and overlays are never lower panes.
+    pub fn pane_should_render(&self, id: Option<u64>) -> bool {
+        (id.is_none() || id.is_some_and(|id| self.visible_lower_pane(id)))
+            && self.maximized_target().is_none_or(|target| target == id)
+    }
+
     pub fn plot_height(&self, id: Option<u64>) -> f32 {
         match id {
             None => self.price_plot_height,
@@ -893,6 +1061,7 @@ impl ChartState {
 
     pub fn pane_collapsed(&self, id: u64) -> bool {
         self.lower_pane(id)
+            && self.maximized_target() != Some(Some(id))
             && self
                 .pane_layouts
                 .get(&id)
@@ -920,6 +1089,39 @@ impl ChartState {
             .instances
             .iter()
             .any(|instance| instance.id == id && !instance.spec.is_overlay())
+    }
+
+    fn visible_lower_pane(&self, id: u64) -> bool {
+        self.indicators
+            .instances
+            .iter()
+            .any(|instance| instance.id == id && instance.visible && !instance.spec.is_overlay())
+    }
+
+    fn move_pane(&mut self, id: u64, direction: i32) {
+        if direction == 0 {
+            return;
+        }
+        let instances = &mut self.indicators.instances;
+        let Some(index) = instances.iter().position(|instance| {
+            instance.id == id && instance.visible && !instance.spec.is_overlay()
+        }) else {
+            return;
+        };
+        let participates =
+            |instance: &IndicatorInstance| instance.visible && !instance.spec.is_overlay();
+        let neighbor = if direction < 0 {
+            instances[..index].iter().rposition(participates)
+        } else {
+            instances[index + 1..]
+                .iter()
+                .position(participates)
+                .map(|offset| index + 1 + offset)
+        };
+        if let Some(neighbor) = neighbor {
+            // Swap ownership, never clone/recalculate any indicator histories.
+            instances.swap(index, neighbor);
+        }
     }
 
     fn activate_pane(&mut self, id: Option<u64>) {
@@ -1045,8 +1247,10 @@ impl ChartState {
 
     fn zoom_time(&mut self, factor: f64, anchor: f64) {
         if factor.is_finite() && factor > 0.0 && factor != 1.0 && anchor.is_finite() {
-            let span =
-                (self.viewport.span * factor).clamp(10.0 * self.step(), 10000.0 * self.step());
+            let span = (self.viewport.span * factor).clamp(
+                MIN_VISIBLE_BARS * self.step(),
+                MAX_VISIBLE_BARS * self.step(),
+            );
             self.viewport.left = (self.viewport.left
                 + (self.viewport.span - span) * anchor.clamp(0.0, 1.0))
             .clamp(-1e12, 1e12);
@@ -1070,6 +1274,29 @@ impl ChartState {
         match action {
             // Canvas caches already invalidate on changed bounds. Presentation-only
             // commands must not refit values, rebuild data, or clear unrelated caches.
+            Action::MovePane { id, direction } => {
+                self.move_pane(id, direction);
+                return false;
+            }
+            Action::TogglePaneMaximized(id) => {
+                if id.is_some_and(|id| !self.visible_lower_pane(id)) {
+                    return false;
+                }
+                self.maximized_pane = if self.maximized_target() == Some(id) {
+                    None
+                } else {
+                    Some(id)
+                };
+                return false;
+            }
+            Action::GotoTime(time) => {
+                self.viewport.left = time as f64 - self.viewport.span * 0.5;
+                self.viewport.live = false;
+                self.inspection = None;
+                self.native_inspection_ms = None;
+                // Paging and coverage reporting belong to the current-market
+                // controller. No candle/value is inferred for the requested time.
+            }
             Action::SetPaneHeight { id, height } => {
                 self.set_plot_height(id, height);
                 return false;
@@ -1412,6 +1639,7 @@ impl ChartState {
             | Action::SelectMarket(_)
             | Action::ScrollPanes { .. } => return false,
         }
+        self.maximized_pane = self.maximized_target();
         true
     }
 }
@@ -1420,6 +1648,10 @@ impl ChartState {
 mod tests {
     use super::*;
     use mexc_indicators::CvdReset;
+    use mexc_indicators::profiles::{
+        Kind as ProfileKind, Range as ProfileRange, Spec as ProfileSpec,
+    };
+    use mexc_model::executions::NativeInstrument;
     use mexc_model::{Exchange, FlowBar, FlowQuality, Product, VolumeFlow};
     fn candle(time: i64, close: f64) -> Candle {
         Candle {
@@ -1438,6 +1670,522 @@ mod tests {
             candles,
             next_before: None,
         }
+    }
+
+    #[test]
+    fn native_drawing_dirty_suffix_accumulates_corrections_and_ignores_projection_changes() {
+        let mut state = ChartState::default();
+        assert_eq!(state.take_candle_dirty_from(), Some(0));
+        state.merge_stream(candle(0, 10.0));
+        state.merge_stream(candle(300, 11.0));
+        state.merge_stream(candle(600, 12.0));
+        assert_eq!(state.take_candle_dirty_from(), Some(0));
+        state.merge_stream(candle(300, 15.0));
+        let mut tail = candle(600, 12.0);
+        tail.volume = 4.0;
+        state.merge_stream(tail);
+        assert_eq!(state.take_candle_dirty_from(), Some(1));
+        assert_eq!(state.take_candle_dirty_from(), None);
+        state.dispatch(Action::GotoTime(100));
+        assert_eq!(state.take_candle_dirty_from(), None);
+        state.merge_page(&page(vec![candle(-300, 5.0)]), 0);
+        assert_eq!(state.take_candle_dirty_from(), Some(0));
+    }
+
+    fn profile_configs(market: &Market) -> Vec<ProfileInstance> {
+        let mut fixed = ProfileSpec::default_for(ProfileKind::Volume);
+        fixed.range = ProfileRange::Fixed {
+            start_ms: 1_704_067_200_000,
+            end_ms: 1_704_153_600_000,
+        };
+        fixed.ticks_per_row = 7;
+        fixed.value_area_percent = 68;
+        fixed.display.width_percent = 37;
+        let mut visible = ProfileSpec::default_for(ProfileKind::Tpo);
+        visible.range = ProfileRange::Visible;
+        visible.display.letters = true;
+        vec![
+            ProfileInstance {
+                id: 41,
+                spec: ProfileSpec::default_for(ProfileKind::Tpo),
+                visible: true,
+                instrument: None,
+            },
+            ProfileInstance {
+                id: 7,
+                spec: fixed,
+                visible: false,
+                instrument: Some(NativeInstrument::from_market(market)),
+            },
+            ProfileInstance {
+                id: 19,
+                spec: visible,
+                visible: false,
+                instrument: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn workspace_restore_is_transactional_and_preserves_manual_presentation_on_first_history() {
+        let mut state = ChartState::default();
+        state.merge_page(&page(vec![candle(0, 10.0), candle(300, 12.0)]), 5);
+        let id = state
+            .indicators
+            .add(
+                IndicatorSpec::Rsi { period: 2 },
+                &state.candles,
+                state.market.interval,
+            )
+            .unwrap();
+        state.viewport.live = false;
+        state.viewport.left = -60_000.0;
+        state.viewport.span = 30_000.0;
+        state.viewport.auto_fit = false;
+        state.viewport.low = 7.0;
+        state.viewport.high = 19.0;
+        state.pane_scales.insert(
+            id,
+            PaneScale {
+                auto_fit: false,
+                low: -25.0,
+                high: 150.0,
+            },
+        );
+        state.pane_layouts.insert(
+            id,
+            PaneLayout {
+                height: 277.0,
+                collapsed: true,
+            },
+        );
+        state.price_plot_height = 451.0;
+        state.active_pane = Some(id);
+        state.maximized_pane = Some(Some(id));
+        state.inspection = Some((0, 10.0));
+        state.native_inspection_ms = Some(1);
+        state.next_before = Some(-300);
+        state.open_interest.connected = true;
+        state.open_interest.message = "Transient feed state".into();
+        state.profiles = profile_configs(&state.market);
+        let profiles = state.profiles.clone();
+        let saved = state.workspace_snapshot();
+        let mut invalid = saved.clone();
+        invalid.panes[0].id = 999;
+        assert!(state.restore_workspace(&invalid).is_err());
+        assert_eq!(state.workspace_snapshot(), saved);
+        assert_eq!(state.len(), 2);
+        assert!(state.maximized());
+        state.restore_workspace(&saved).unwrap();
+        assert!(state.candles.is_empty());
+        assert!(state.stream_epochs.is_empty());
+        assert!(state.pending_flow.is_empty());
+        assert!(state.indicators.instances[0].points.is_empty());
+        assert!(state.indicators.instances[0].external.is_none());
+        assert!(state.open_interest.samples.is_empty());
+        assert!(!state.open_interest.connected);
+        assert!(state.open_interest.message.is_empty());
+        assert!(state.inspection.is_none());
+        assert!(state.native_inspection_ms.is_none());
+        assert!(state.next_before.is_none());
+        assert!(!state.initialized);
+        assert!(!state.maximized());
+        assert_eq!(state.workspace_snapshot(), saved);
+        assert_eq!(state.profiles, profiles);
+        state.merge_page(
+            &page(vec![
+                candle(1_700_000_000, 20.0),
+                candle(1_700_000_300, 22.0),
+            ]),
+            0,
+        );
+        assert!(state.initialized);
+        assert_eq!(state.workspace_snapshot(), saved);
+        assert_eq!(state.viewport.low, 7.0);
+        assert_eq!(state.viewport.high, 19.0);
+        assert_eq!(
+            state.pane_scale(id),
+            PaneScale {
+                auto_fit: false,
+                low: -25.0,
+                high: 150.0
+            }
+        );
+        assert!(state.pane_collapsed(id));
+        assert_eq!(state.plot_height(Some(id)), 277.0);
+        let new_id = state
+            .indicators
+            .add(
+                IndicatorSpec::Atr { period: 2 },
+                &state.candles,
+                state.market.interval,
+            )
+            .unwrap();
+        assert!(new_id > id);
+    }
+
+    #[test]
+    fn restored_live_view_follows_fresh_native_data_but_retains_manual_price_scale() {
+        let mut state = ChartState::default();
+        state.viewport.auto_fit = false;
+        state.viewport.low = 100.0;
+        state.viewport.high = 200.0;
+        let saved = state.workspace_snapshot();
+        state.restore_workspace(&saved).unwrap();
+        state.merge_page(&page(vec![candle(1_700_000_000, 150.0)]), 1);
+        assert!(state.viewport.live);
+        assert_ne!(state.viewport.left, 0.0);
+        assert_eq!(state.viewport.low, 100.0);
+        assert_eq!(state.viewport.high, 200.0);
+        assert_eq!(state.workspace_snapshot(), saved);
+        state.reapply_workspace_view(&saved.view).unwrap();
+        assert_eq!(state.workspace_snapshot(), saved);
+    }
+
+    #[test]
+    fn profile_configuration_is_transactional_and_survives_native_market_and_timeframe_changes() {
+        let mut state = ChartState::default();
+        state.profiles = profile_configs(&state.market);
+        state.merge_page(&page(vec![candle(0, 10.0), candle(300, 12.0)]), 1);
+        let profiles = state.profiles.clone();
+        let saved = state.workspace_snapshot();
+        let mut invalid = saved.clone();
+        invalid.profiles[1].instrument = None;
+        assert!(state.restore_workspace(&invalid).is_err());
+        assert_eq!(state.workspace_snapshot(), saved);
+        assert_eq!(state.candles(), &[candle(0, 10.0), candle(300, 12.0)]);
+
+        let mut market = state.market.clone();
+        market.interval = Timeframe::Hour8;
+        state.select_market(market.clone(), 8);
+        assert_eq!(state.profiles, profiles);
+        assert_eq!(state.workspace_snapshot().profiles, saved.profiles,);
+        market.exchange = Exchange::Coinbase;
+        market.product = Product::Spot;
+        market.symbol = "Case-sensitive_native".into();
+        state.select_market(market, 6);
+        assert_eq!(state.profiles, profiles);
+        assert_eq!(state.workspace_snapshot().profiles, saved.profiles);
+        state.workspace_snapshot().validate().unwrap();
+
+        state.restore_workspace(&saved).unwrap();
+        assert_eq!(state.profiles, profiles);
+        assert_eq!(state.workspace_snapshot(), saved);
+        assert!(state.candles().is_empty());
+    }
+
+    #[test]
+    fn configured_profiles_never_change_candle_indicator_or_viewport_numerics() {
+        let mut baseline = ChartState::default();
+        let mut configured = ChartState::default();
+        configured.profiles = profile_configs(&configured.market);
+        for state in [&mut baseline, &mut configured] {
+            state.dispatch(Action::AddIndicator(IndicatorSpec::Sma { period: 2 }));
+            state.dispatch(Action::AddIndicator(IndicatorSpec::Rsi { period: 2 }));
+            state.merge_page(
+                &page(vec![candle(0, 10.0), candle(300, 12.0), candle(600, 11.0)]),
+                1,
+            );
+            state.merge_stream(candle(600, 15.0));
+            state.merge_stream(candle(900, 13.0));
+            state.dispatch(Action::Inspect(Some((600.0, 14.0))));
+        }
+        assert_eq!(configured.candles(), baseline.candles());
+        for (actual, expected) in configured
+            .indicators
+            .instances
+            .iter()
+            .zip(&baseline.indicators.instances)
+        {
+            assert_eq!(actual.points, expected.points);
+            assert_eq!(
+                configured.pane_scale(actual.id),
+                baseline.pane_scale(expected.id)
+            );
+        }
+        assert_eq!(
+            (
+                configured.viewport.left,
+                configured.viewport.span,
+                configured.viewport.low,
+                configured.viewport.high
+            ),
+            (
+                baseline.viewport.left,
+                baseline.viewport.span,
+                baseline.viewport.low,
+                baseline.viewport.high
+            ),
+        );
+        assert_eq!(configured.inspection, baseline.inspection);
+        let mut chart = configured.workspace_snapshot();
+        chart.profiles.clear();
+        assert_eq!(chart, baseline.workspace_snapshot());
+    }
+
+    #[test]
+    fn pane_moves_swap_only_visible_lower_slots_without_rebuilding_history() {
+        let mut state = ChartState::default();
+        let mut bar = candle(0, 12.0);
+        bar.flow = Some(exact_flow(2.0, 0, 300_000));
+        state.merge_page(&page(vec![bar]), 0);
+        let first = add_pane(
+            &mut state,
+            IndicatorSpec::Cvd {
+                reset: CvdReset::Continuous,
+            },
+        );
+        let overlay = add_pane(&mut state, IndicatorSpec::Sma { period: 2 });
+        let hidden = add_pane(&mut state, IndicatorSpec::Rsi { period: 2 });
+        let last = add_pane(&mut state, IndicatorSpec::Rsi { period: 3 });
+        state.dispatch(Action::ToggleIndicator(hidden));
+        state.dispatch(Action::SetPaneHeight {
+            id: Some(first),
+            height: 281.0,
+        });
+        state.dispatch(Action::TogglePaneCollapsed(first));
+        state.dispatch(Action::PanePan {
+            id: first,
+            time: 0.0,
+            value: 0.2,
+        });
+        state.dispatch(Action::TogglePaneMaximized(Some(first)));
+        let scale = state.pane_scale(first);
+        let active = state.active_pane;
+        let inspection = state.inspection;
+        let viewport = state.viewport;
+        let candles_ptr = state.candles.as_ptr();
+        let snapshots: Vec<_> = state
+            .indicators
+            .instances
+            .iter()
+            .map(|item| {
+                (
+                    item.id,
+                    item.points.as_ptr(),
+                    item.points.len(),
+                    item.source.clone(),
+                    item.cvd_context(0),
+                )
+            })
+            .collect();
+        let ids = |state: &ChartState| {
+            state
+                .indicators
+                .instances
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(!state.dispatch(Action::MovePane {
+            id: first,
+            direction: 1
+        }));
+        assert_eq!(ids(&state), vec![last, overlay, hidden, first]);
+        assert!(!state.dispatch(Action::MovePane {
+            id: first,
+            direction: i32::MAX
+        }));
+        assert_eq!(ids(&state), vec![last, overlay, hidden, first]);
+        state.dispatch(Action::MovePane {
+            id: first,
+            direction: i32::MIN,
+        });
+        assert_eq!(ids(&state), vec![first, overlay, hidden, last]);
+        for (id, direction) in [
+            (first, -1),
+            (first, 0),
+            (overlay, 1),
+            (hidden, -1),
+            (u64::MAX, 1),
+        ] {
+            state.dispatch(Action::MovePane { id, direction });
+            assert_eq!(ids(&state), vec![first, overlay, hidden, last]);
+        }
+        for (id, ptr, len, source, context) in snapshots {
+            let item = state
+                .indicators
+                .instances
+                .iter()
+                .find(|item| item.id == id)
+                .unwrap();
+            assert_eq!(item.points.as_ptr(), ptr);
+            assert_eq!(item.points.len(), len);
+            assert_eq!(item.source, source);
+            assert_eq!(item.cvd_context(0), context);
+        }
+        assert_eq!(state.candles.as_ptr(), candles_ptr);
+        assert_eq!(state.pane_scale(first), scale);
+        assert_eq!(state.plot_height(Some(first)), 281.0);
+        assert!(state.pane_layouts[&first].collapsed);
+        assert_eq!(state.active_pane, active);
+        assert_eq!(state.inspection, inspection);
+        assert_eq!(state.viewport.left, viewport.left);
+        assert_eq!(state.viewport.low, viewport.low);
+        assert_eq!(state.maximized_target(), Some(Some(first)));
+    }
+
+    #[test]
+    fn maximize_is_reversible_presentation_and_invalid_targets_restore_normal_layout() {
+        let mut state = ChartState::default();
+        let mut bar = candle(0, 12.0);
+        bar.flow = Some(exact_flow(2.0, 0, 300_000));
+        state.merge_page(&page(vec![bar]), 0);
+        let id = add_pane(
+            &mut state,
+            IndicatorSpec::Cvd {
+                reset: CvdReset::Continuous,
+            },
+        );
+        let other = add_pane(&mut state, IndicatorSpec::Rsi { period: 2 });
+        state.dispatch(Action::SetPaneHeight {
+            id: None,
+            height: 477.0,
+        });
+        state.dispatch(Action::SetPaneHeight {
+            id: Some(id),
+            height: 273.0,
+        });
+        state.dispatch(Action::TogglePaneCollapsed(id));
+        state.dispatch(Action::PanePan {
+            id,
+            time: 0.0,
+            value: 0.5,
+        });
+        state.dispatch(Action::InspectPane {
+            id: Some(id),
+            point: Some((0.0, 12.0)),
+        });
+        let scale = state.pane_scale(id);
+        let viewport = state.viewport;
+        let inspection = state.inspection;
+        let source = state.indicators.instances[0].source.clone();
+        let origin = state.indicators.instances[0].cvd_context(0).unwrap().origin;
+        let points_ptr = state.indicators.instances[0].points.as_ptr();
+
+        assert!(!state.dispatch(Action::TogglePaneMaximized(Some(id))));
+        assert_eq!(state.maximized_target(), Some(Some(id)));
+        assert!(state.pane_should_render(Some(id)));
+        assert!(!state.pane_should_render(None));
+        assert!(!state.pane_should_render(Some(other)));
+        assert!(!state.pane_collapsed(id));
+        assert!(state.pane_layouts[&id].collapsed);
+        assert_eq!(state.active_pane, Some(id));
+        state.dispatch(Action::TogglePaneMaximized(Some(id)));
+        assert!(!state.maximized());
+        assert!(state.pane_collapsed(id));
+        assert!(state.pane_should_render(None));
+        assert!(state.pane_should_render(Some(other)));
+        assert_eq!(state.plot_height(None), 477.0);
+        assert_eq!(state.plot_height(Some(id)), 273.0);
+        assert_eq!(state.pane_scale(id), scale);
+        assert_eq!(state.viewport.left, viewport.left);
+        assert_eq!(state.viewport.low, viewport.low);
+        assert_eq!(state.viewport.high, viewport.high);
+        assert_eq!(state.viewport.auto_fit, viewport.auto_fit);
+        assert_eq!(state.viewport.live, viewport.live);
+        assert_eq!(state.inspection, inspection);
+        assert_eq!(state.indicators.instances[0].source, source);
+        assert_eq!(state.indicators.instances[0].points.as_ptr(), points_ptr);
+        assert_eq!(
+            state.indicators.instances[0].cvd_context(0).unwrap().origin,
+            origin
+        );
+
+        state.dispatch(Action::TogglePaneMaximized(None));
+        assert_eq!(state.maximized_target(), Some(None));
+        state.dispatch(Action::TogglePaneMaximized(Some(id)));
+        assert_eq!(state.maximized_target(), Some(Some(id)));
+        state.dispatch(Action::TogglePaneMaximized(Some(u64::MAX)));
+        assert_eq!(state.maximized_target(), Some(Some(id)));
+        state.dispatch(Action::ToggleIndicator(id));
+        assert!(!state.maximized());
+        assert!(!state.pane_should_render(Some(id)));
+        state.dispatch(Action::ToggleIndicator(id));
+        assert!(!state.maximized());
+        assert!(state.pane_collapsed(id));
+        state.dispatch(Action::TogglePaneMaximized(Some(id)));
+        state.dispatch(Action::ConfigureIndicator {
+            id,
+            spec: IndicatorSpec::Sma { period: 2 },
+        });
+        assert!(!state.maximized());
+        assert!(!state.pane_should_render(Some(id)));
+        state.dispatch(Action::TogglePaneMaximized(Some(id)));
+        assert!(!state.maximized());
+        state.dispatch(Action::TogglePaneMaximized(Some(other)));
+        state.dispatch(Action::ApplyIndicator {
+            id: Some(other),
+            spec: IndicatorSpec::Ema { period: 2 },
+            source: IndicatorSource::default(),
+        });
+        assert!(!state.maximized());
+        let removed = add_pane(&mut state, IndicatorSpec::Rsi { period: 2 });
+        state.dispatch(Action::TogglePaneMaximized(Some(removed)));
+        state.dispatch(Action::RemoveIndicator(removed));
+        assert!(!state.maximized());
+        assert!(state.pane_should_render(None));
+        state.dispatch(Action::TogglePaneMaximized(None));
+        state.select_market(state.market.clone(), state.price_scale);
+        assert!(!state.maximized());
+    }
+
+    #[test]
+    fn goto_time_only_centers_time_and_clears_inspection_without_claiming_history() {
+        let mut state = ChartState::default();
+        state.merge_page(&page(vec![candle(0, 12.0), candle(300, 15.0)]), 0);
+        let id = add_pane(&mut state, IndicatorSpec::OpenInterest);
+        state.dispatch(Action::PanePan {
+            id,
+            time: 0.0,
+            value: 0.2,
+        });
+        state.dispatch(Action::TogglePaneMaximized(Some(id)));
+        state.inspection = Some((300, 15.0));
+        state.native_inspection_ms = Some(300_123);
+        state.next_before = Some(0);
+        let viewport = state.viewport;
+        let scale = state.pane_scale(id);
+        let epoch = state.epoch;
+        let ptr = state.candles.as_ptr();
+        assert!(state.dispatch(Action::GotoTime(-100_000)));
+        assert_eq!(state.viewport.left, -100_000.0 - viewport.span * 0.5);
+        assert_eq!(state.viewport.span, viewport.span);
+        assert_eq!(state.viewport.low, viewport.low);
+        assert_eq!(state.viewport.high, viewport.high);
+        assert_eq!(state.viewport.auto_fit, viewport.auto_fit);
+        assert!(!state.viewport.live);
+        assert_eq!(state.pane_scale(id), scale);
+        assert_eq!(state.active_pane, Some(id));
+        assert_eq!(state.maximized_target(), Some(Some(id)));
+        assert!(state.inspection.is_none());
+        assert!(state.inspection_time_ms().is_none());
+        assert!(state.inspected().is_none());
+        assert_eq!(state.candles.as_ptr(), ptr);
+        assert_eq!(state.len(), 2);
+        assert_eq!(state.epoch, epoch);
+        assert_eq!(state.next_before, Some(0));
+        assert!(state.visible().next().is_none());
+        assert!(state.needs_older());
+        state.next_before = None;
+        state.dispatch(Action::GotoTime(-200_000));
+        assert!(!state.needs_older());
+        assert_eq!(state.next_before, None);
+        assert!(state.visible().next().is_none());
+    }
+
+    #[test]
+    fn a_jump_before_initial_history_is_not_overwritten_by_the_first_page() {
+        let mut state = ChartState::default();
+        state.dispatch(Action::GotoTime(-100_000));
+        let left = state.viewport.left;
+        state.merge_page(&page(vec![candle(0, 12.0), candle(300, 15.0)]), 0);
+        assert!(state.initialized);
+        assert!(!state.viewport.live);
+        assert_eq!(state.viewport.left, left);
+        assert!(state.inspection.is_none());
+        assert!(state.inspection_time_ms().is_none());
     }
 
     #[test]

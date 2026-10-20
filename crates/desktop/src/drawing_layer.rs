@@ -14,11 +14,13 @@ use std::cell::Cell;
 struct Key {
     context: u64,
     revision: u64,
+    vwap_revision: u64,
     projection: Projection,
     palette: Palette,
     price_scale: u32,
     quote: Option<Quote>,
     edited: Option<DrawingId>,
+    candle_range: (usize, Option<i64>, Option<i64>),
 }
 
 #[derive(Default)]
@@ -32,6 +34,7 @@ pub struct View<'a> {
     pub interaction: &'a Interaction,
     pub scene: &'a Scene,
     pub projection: &'a Cell<Option<Projection>>,
+    pub native_candles: &'a [mexc_model::Candle],
 }
 
 impl Scene {
@@ -49,11 +52,17 @@ impl Scene {
         let key = Key {
             context: view.store.generation(),
             revision: view.store.revision(),
+            vwap_revision: view.store.vwap_revision(),
             projection,
             palette,
             price_scale,
             quote: Quote::parse(quote),
             edited: view.interaction.dragging_id(),
+            candle_range: (
+                view.native_candles.len(),
+                view.native_candles.first().map(|candle| candle.time),
+                view.native_candles.last().map(|candle| candle.time),
+            ),
         };
         if self.key.get() != Some(key) {
             self.key.set(Some(key));
@@ -65,15 +74,38 @@ impl Scene {
                 view.store.objects(),
                 projection,
                 palette,
-                price_scale,
-                quote,
+                &drawing_geometry::NativeLabels {
+                    price_scale,
+                    quote,
+                    candles: view.native_candles,
+                },
                 key.edited,
+                Some(view.store),
             );
         })
     }
 }
 
 impl View<'_> {
+    pub fn snap(
+        &self,
+        projection: Projection,
+        point: Point,
+    ) -> Option<crate::drawing_types::Anchor> {
+        let anchored = self.interaction.tool() == crate::drawing_types::Tool::AnchoredVwap
+            || (self.interaction.tool() == crate::drawing_types::Tool::Select
+                && self.store.selected_drawing().is_some_and(|drawing| {
+                    matches!(drawing.shape, crate::drawing_types::Shape::AnchoredVwap(_))
+                }));
+        if anchored {
+            drawing_geometry::native_anchor(projection, point, self.native_candles)
+        } else if self.interaction.magnet() && projection.contains(point) {
+            drawing_geometry::magnet(projection, point, self.native_candles.iter())
+        } else {
+            None
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
@@ -109,6 +141,8 @@ impl View<'_> {
             palette,
             price_scale,
             quote,
+            self.native_candles,
+            Some(self.store),
         );
         [committed, overlay.into_geometry()]
     }

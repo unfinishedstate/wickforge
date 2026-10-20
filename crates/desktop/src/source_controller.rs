@@ -3,10 +3,13 @@ use std::sync::Arc;
 
 use arrayvec::ArrayVec;
 use iced::{Subscription, Task};
-use mexc_indicators::{IndicatorKind, IndicatorSource, IndicatorSpec, SourceData, SourceMode};
+use mexc_indicators::{
+    IndicatorInstance, IndicatorKind, IndicatorSource, IndicatorSpec, SourceCondition, SourceData,
+    SourceMode,
+};
 use mexc_model::{
     Catalog, Exchange, FlowAvailability, FlowBar, HistoryEvent, Instrument, Market, MarketEvent,
-    OpenInterestEvent, Product, Timeframe,
+    OpenInterestEvent, OpenInterestTimestamp, Product, Timeframe,
 };
 use tokio::sync::watch;
 
@@ -20,6 +23,167 @@ pub struct Request {
 pub type Requests = HashMap<(Market, source_feeds::Kind), Request>;
 pub type Catalogs = HashMap<(Exchange, Product), Result<Arc<Catalog>, String>>;
 pub type PendingCatalogs = HashSet<(Exchange, Product)>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Remedy {
+    Wait,
+    Repair,
+    Retry(Market),
+    Discovery(Exchange, Product),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockerKind {
+    DiscoveryPending(Exchange, Product),
+    DiscoveryMissing(Exchange, Product),
+    DiscoveryFailed(Exchange, Product),
+    MissingMembership(Exchange, Product),
+    NativeEligibility,
+    MetadataPending,
+    IdentityMismatch,
+    MissingInput,
+    Contributor(SourceCondition),
+    AggregateCoverage,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceBlocker {
+    pub kind: BlockerKind,
+    pub message: String,
+    pub remedy: Remedy,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContributorHealth {
+    pub market: Market,
+    pub condition: SourceCondition,
+    pub validated: bool,
+    pub asof_ms: Option<i64>,
+    pub timestamp_source: Option<OpenInterestTimestamp>,
+    pub raw_status: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SourceHealth {
+    pub blockers: Vec<SourceBlocker>,
+    pub contributors: Vec<ContributorHealth>,
+    pub now_ms: i64,
+}
+
+impl SourceHealth {
+    pub fn needs_repair(&self) -> bool {
+        self.blockers
+            .iter()
+            .any(|blocker| blocker.remedy == Remedy::Repair)
+    }
+}
+
+fn discovery_blockers(
+    catalogs: &Catalogs,
+    pending: &PendingCatalogs,
+    source: &IndicatorSource,
+    kind: IndicatorKind,
+    chart: &Market,
+    base_asset: &str,
+) -> Vec<SourceBlocker> {
+    let mut blockers = Vec::new();
+    if base_asset.is_empty() {
+        blockers.push(SourceBlocker {
+            kind: BlockerKind::MetadataPending,
+            message: "Awaiting catalog-confirmed chart underlying metadata".into(),
+            remedy: Remedy::Wait,
+        });
+        return blockers;
+    }
+    for exchange in Exchange::ALL {
+        let scope = (exchange, chart.product);
+        let required = source.mode == SourceMode::All
+            || source
+                .markets
+                .iter()
+                .any(|market| market.exchange == exchange);
+        if !required {
+            continue;
+        }
+        let catalog = match catalogs.get(&scope) {
+            _ if pending.contains(&scope) => {
+                blockers.push(SourceBlocker {
+                    kind: BlockerKind::DiscoveryPending(exchange, chart.product),
+                    message: format!("{exchange} {} native discovery pending", chart.product),
+                    remedy: Remedy::Wait,
+                });
+                continue;
+            }
+            Some(Ok(catalog)) => catalog,
+            Some(Err(error)) => {
+                blockers.push(SourceBlocker {
+                    kind: BlockerKind::DiscoveryFailed(exchange, chart.product),
+                    message: format!(
+                        "{exchange} {} native discovery failed: {error}",
+                        chart.product
+                    ),
+                    remedy: Remedy::Discovery(exchange, chart.product),
+                });
+                continue;
+            }
+            None if source.mode == SourceMode::All => {
+                blockers.push(SourceBlocker {
+                    kind: BlockerKind::DiscoveryMissing(exchange, chart.product),
+                    message: format!("{exchange} {} native discovery not started", chart.product),
+                    remedy: Remedy::Discovery(exchange, chart.product),
+                });
+                continue;
+            }
+            None => continue,
+        };
+        if let Some(error) = source_catalog_scope_error(catalog, exchange, chart.product) {
+            blockers.push(SourceBlocker {
+                kind: BlockerKind::DiscoveryFailed(exchange, chart.product),
+                message: error,
+                remedy: Remedy::Discovery(exchange, chart.product),
+            });
+            continue;
+        }
+        let eligible = || {
+            eligible_source_instruments(catalog, kind, chart.product, chart.interval, base_asset)
+        };
+        for selected in source
+            .markets
+            .iter()
+            .filter(|market| market.exchange == exchange)
+        {
+            if selected.product != chart.product
+                || !eligible().any(|item| item.symbol == selected.symbol)
+            {
+                blockers.push(SourceBlocker {
+                    kind: BlockerKind::NativeEligibility,
+                    message: format!(
+                        "{exchange} {} {} is not native-eligible for {kind} on chart {base_asset} {} / {}",
+                        selected.product, selected.symbol, chart.product, chart.interval
+                    ),
+                    remedy: Remedy::Repair,
+                });
+            }
+        }
+        if source.mode == SourceMode::All
+            && eligible().next().is_some()
+            && !source
+                .markets
+                .iter()
+                .any(|selected| selected.exchange == exchange)
+        {
+            blockers.push(SourceBlocker {
+                kind: BlockerKind::MissingMembership(exchange, chart.product),
+                message: format!(
+                    "Missing required {exchange} {base_asset} {} membership for All sources / {}",
+                    chart.product, chart.interval
+                ),
+                remedy: Remedy::Repair,
+            });
+        }
+    }
+    blockers
+}
 
 /// The composer and running All aggregates must use the same native eligibility rules.
 pub fn eligible_source_instruments<'a>(
@@ -92,67 +256,10 @@ fn all_source_error(
     chart: &Market,
     base_asset: &str,
 ) -> Option<String> {
-    if base_asset.is_empty() {
-        return Some("All sources await catalog-confirmed chart underlying metadata".into());
-    }
-    // The checklist exposes every venue; the legend needs one actionable blocker.
-    // Coverage is accepted only after all four scopes and every explicit choice pass.
-    for exchange in Exchange::ALL {
-        let scope = (exchange, chart.product);
-        let catalog = match catalogs.get(&scope) {
-            _ if pending.contains(&scope) => {
-                return Some(format!(
-                    "Awaiting {exchange} {} native catalog discovery (chart {base_asset} / {})",
-                    chart.product, chart.interval
-                ));
-            }
-            Some(Ok(catalog)) => catalog,
-            Some(Err(_)) => {
-                return Some(format!(
-                    "{exchange} {} native discovery failed. Repair source to retry discovery.",
-                    chart.product
-                ));
-            }
-            None => {
-                return Some(format!(
-                    "Awaiting {exchange} {} native catalog discovery (chart {base_asset} / {})",
-                    chart.product, chart.interval
-                ));
-            }
-        };
-        if let Some(error) = source_catalog_scope_error(catalog, exchange, chart.product) {
-            return Some(error);
-        }
-        let eligible = || {
-            eligible_source_instruments(catalog, kind, chart.product, chart.interval, base_asset)
-        };
-        for selected in source
-            .markets
-            .iter()
-            .filter(|market| market.exchange == exchange)
-        {
-            if selected.product != chart.product
-                || !eligible().any(|item| item.symbol == selected.symbol)
-            {
-                return Some(format!(
-                    "Selected {exchange} {} {} is not eligible for {kind} on chart {base_asset} {} / {}",
-                    selected.product, selected.symbol, chart.product, chart.interval
-                ));
-            }
-        }
-        if eligible().next().is_some()
-            && !source
-                .markets
-                .iter()
-                .any(|selected| selected.exchange == exchange)
-        {
-            return Some(format!(
-                "Choose an eligible native {exchange} {base_asset} {} market for All sources (chart {})",
-                chart.product, chart.interval
-            ));
-        }
-    }
-    None
+    discovery_blockers(catalogs, pending, source, kind, chart, base_asset)
+        .into_iter()
+        .next()
+        .map(|blocker| blocker.message)
 }
 
 pub fn now_ms() -> i64 {
@@ -164,7 +271,336 @@ pub fn now_ms() -> i64 {
 }
 
 impl Desktop {
+    pub(crate) fn indicator_source_health(&self, instance: &IndicatorInstance) -> SourceHealth {
+        let now = now_ms();
+        let mut health = SourceHealth {
+            now_ms: now,
+            ..SourceHealth::default()
+        };
+        if instance.source.is_chart() {
+            return health;
+        }
+        health.blockers = discovery_blockers(
+            &self.source_catalogs,
+            &self.source_catalog_pending,
+            &instance.source,
+            instance.spec.kind(),
+            &self.chart.market,
+            &self.chart.base_asset,
+        );
+        let oi = instance.spec == IndicatorSpec::OpenInterest;
+        for selected in &instance.source.markets {
+            let mut market = selected.clone();
+            market.interval = self.chart.market.interval;
+            let name = format!("{} {} {}", market.exchange, market.product, market.symbol);
+            if market.product != self.chart.market.product {
+                health.blockers.push(SourceBlocker {
+                    kind: BlockerKind::IdentityMismatch,
+                    message: format!(
+                        "{name}: product does not match chart {}",
+                        self.chart.market.product
+                    ),
+                    remedy: Remedy::Repair,
+                });
+                continue;
+            }
+            let Some(input) = self.source_inputs.get(&market) else {
+                health.blockers.push(SourceBlocker {
+                    kind: BlockerKind::MissingInput,
+                    message: format!("{name}: required native input is not loaded"),
+                    remedy: Remedy::Retry(market),
+                });
+                continue;
+            };
+            if input.market != market
+                || (!input.base_asset.is_empty() && input.base_asset != self.chart.base_asset)
+            {
+                health.blockers.push(SourceBlocker {
+                    kind: BlockerKind::IdentityMismatch,
+                    message: format!("{name}: native identity or underlying does not match chart"),
+                    remedy: Remedy::Repair,
+                });
+                continue;
+            }
+            if input.base_asset.is_empty() {
+                health.blockers.push(SourceBlocker {
+                    kind: BlockerKind::MetadataPending,
+                    message: format!("{name}: awaiting catalog-confirmed underlying metadata"),
+                    remedy: Remedy::Retry(market.clone()),
+                });
+            }
+            let diagnostic =
+                input.diagnostics(oi, instance.points.last().map(|point| point.time), now);
+            let validated = !input.base_asset.is_empty()
+                && !self
+                    .source_catalog_pending
+                    .contains(&(market.exchange, market.product))
+                && self
+                    .source_catalogs
+                    .get(&(market.exchange, market.product))
+                    .is_none_or(|result| {
+                        result.as_ref().is_ok_and(|catalog| {
+                            eligible_source_instruments(
+                                catalog,
+                                instance.spec.kind(),
+                                self.chart.market.product,
+                                self.chart.market.interval,
+                                &self.chart.base_asset,
+                            )
+                            .any(|item| item.symbol == market.symbol)
+                        })
+                    });
+            let problem = match diagnostic.condition {
+                SourceCondition::Disconnected => Some("native stream disconnected"),
+                SourceCondition::MissingObservation => Some("no actual native observation"),
+                SourceCondition::Stale => Some("native observations stale"),
+                SourceCondition::IncompleteCoverage => Some("incomplete native coverage"),
+                SourceCondition::Current => None,
+            };
+            if let Some(problem) = problem {
+                health.blockers.push(SourceBlocker {
+                    kind: BlockerKind::Contributor(diagnostic.condition),
+                    message: format!("{name}: {problem}"),
+                    remedy: Remedy::Retry(market.clone()),
+                });
+            }
+            health.contributors.push(ContributorHealth {
+                market,
+                condition: diagnostic.condition,
+                validated,
+                asof_ms: diagnostic.asof_ms,
+                timestamp_source: diagnostic.timestamp_source,
+                raw_status: if oi {
+                    input.oi_status.clone()
+                } else {
+                    input.flow_status.clone()
+                },
+            });
+        }
+        if health.blockers.is_empty()
+            && !instance
+                .external
+                .as_ref()
+                .is_some_and(|output| output.complete)
+        {
+            health.blockers.push(SourceBlocker {
+                kind: BlockerKind::AggregateCoverage,
+                message: "Selected sources lack shared-origin / complete aggregate coverage".into(),
+                remedy: Remedy::Repair,
+            });
+        }
+        health
+    }
+
+    pub(crate) fn retry_indicator_source_discovery(
+        &mut self,
+        id: u64,
+        exchange: Exchange,
+        product: Product,
+    ) -> Task<Message> {
+        let Some(instance) = self
+            .chart
+            .indicators
+            .instances
+            .iter()
+            .find(|instance| instance.id == id)
+        else {
+            return Task::none();
+        };
+        if instance.source.is_chart()
+            || product != self.chart.market.product
+            || (instance.source.mode != SourceMode::All
+                && !instance
+                    .source
+                    .markets
+                    .iter()
+                    .any(|market| market.exchange == exchange && market.product == product))
+            || self.source_catalog_pending.contains(&(exchange, product))
+            || self
+                .source_catalogs
+                .get(&(exchange, product))
+                .is_some_and(|result| {
+                    result.as_ref().is_ok_and(|catalog| {
+                        source_catalog_scope_error(catalog, exchange, product).is_none()
+                    })
+                })
+        {
+            return Task::none();
+        }
+        self.source_catalogs.remove(&(exchange, product));
+        // Catalog responses share a generation. Requeue pending scopes so old responses
+        // cannot consume a newly pending scope; retain all successful discoveries.
+        self.source_catalog_generation = self.source_catalog_generation.wrapping_add(1);
+        let pending = self.source_catalog_pending.drain().collect::<Vec<_>>();
+        let mut tasks = vec![self.retry_source_catalog_scope(exchange, product)];
+        for (pending_exchange, pending_product) in pending {
+            tasks.push(self.retry_source_catalog_scope(pending_exchange, pending_product));
+        }
+        self.revalidate_all_sources();
+        self.refresh_source_panes();
+        tasks.push(self.ensure_source_catalogs());
+        Task::batch(tasks)
+    }
+
+    fn retry_source_catalog_scope(
+        &mut self,
+        exchange: Exchange,
+        product: Product,
+    ) -> Task<Message> {
+        if !self.source_catalog_pending.insert((exchange, product)) {
+            return Task::none();
+        }
+        let data = self.data.clone();
+        let generation = self.source_catalog_generation;
+        Task::perform(
+            async move {
+                data.retry_catalog(exchange, product)
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            },
+            move |result| Message::SourceCatalog {
+                exchange,
+                product,
+                generation,
+                result,
+            },
+        )
+    }
+
+    pub(crate) fn retry_indicator_contributor(
+        &mut self,
+        id: u64,
+        market: &Market,
+    ) -> Task<Message> {
+        let Some(instance) = self
+            .chart
+            .indicators
+            .instances
+            .iter()
+            .find(|instance| instance.id == id)
+        else {
+            return Task::none();
+        };
+        let kind = match instance.spec {
+            IndicatorSpec::Cvd { .. } if !instance.source.is_chart() => source_feeds::Kind::Cvd,
+            IndicatorSpec::OpenInterest if !instance.source.is_chart() => {
+                source_feeds::Kind::OpenInterest
+            }
+            _ => return Task::none(),
+        };
+        if market.interval != self.chart.market.interval
+            || market.product != self.chart.market.product
+            || !instance.source.markets.iter().any(|selected| {
+                selected.exchange == market.exchange
+                    && selected.product == market.product
+                    && selected.symbol == market.symbol
+            })
+        {
+            return Task::none();
+        }
+        if self.source_inputs.get(market).is_some_and(|input| {
+            input.market != *market
+                || (!input.base_asset.is_empty() && input.base_asset != self.chart.base_asset)
+        }) || self
+            .source_catalogs
+            .get(&(market.exchange, market.product))
+            .is_some_and(|result| {
+                result.as_ref().is_ok_and(|catalog| {
+                    !eligible_source_instruments(
+                        catalog,
+                        instance.spec.kind(),
+                        self.chart.market.product,
+                        self.chart.market.interval,
+                        &self.chart.base_asset,
+                    )
+                    .any(|item| item.symbol == market.symbol)
+                })
+            })
+        {
+            return Task::none();
+        }
+        self.next_source_generation = self.next_source_generation.wrapping_add(1);
+        let generation = self.next_source_generation;
+        let target = self.chart.oldest().unwrap_or(i64::MAX);
+        let key = (market.clone(), kind);
+        if let Some(request) = self.source_requests.get_mut(&key) {
+            request.generation = generation;
+        } else {
+            let (target, _) = watch::channel(target);
+            self.source_requests
+                .insert(key, Request { generation, target });
+        }
+        let input = self
+            .source_inputs
+            .entry(market.clone())
+            .or_insert_with(|| SourceData::new(market.clone(), String::new()));
+        match kind {
+            source_feeds::Kind::Cvd => {
+                input.flow_connected = false;
+                input.revoke_unfinished(now_ms());
+                input.flow_status = "Retrying native flow contributor".into();
+            }
+            source_feeds::Kind::OpenInterest => {
+                input.oi_connected = false;
+                input.oi_status = "Retrying native OI contributor".into();
+            }
+        }
+        input.revision = input.revision.wrapping_add(1);
+        // All consumers of this exact shared feed see revocation immediately. Other
+        // kinds and markets, finalized history, and chart-price subscriptions survive.
+        self.refresh_source_panes();
+        Task::none()
+    }
+
+    pub(crate) fn retry_indicator_sources(&mut self, id: u64) -> Task<Message> {
+        let Some(instance) = self
+            .chart
+            .indicators
+            .instances
+            .iter()
+            .find(|instance| instance.id == id)
+        else {
+            return Task::none();
+        };
+        let health = self.indicator_source_health(instance);
+        let markets = if health.needs_repair() {
+            Vec::new()
+        } else {
+            instance
+                .source
+                .markets
+                .iter()
+                .map(|market| Market {
+                    interval: self.chart.market.interval,
+                    ..market.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut tasks = Vec::new();
+        if health.needs_repair() {
+            tasks.push(self.update(Message::IndicatorSettings(id)));
+        }
+        // The explicit whole-instance command refreshes its selected scopes even
+        // when healthy; per-contributor buttons retry only their named scope.
+        for market in markets {
+            tasks.push(self.retry_indicator_contributor(id, &market));
+        }
+        let mut retried = HashSet::new();
+        for blocker in health.blockers {
+            if let Remedy::Discovery(exchange, product) = blocker.remedy
+                && retried.insert((exchange, product))
+            {
+                tasks.push(self.retry_indicator_source_discovery(id, exchange, product));
+            }
+        }
+        Task::batch(tasks)
+    }
+
     pub(crate) fn ensure_source_catalogs(&mut self) -> Task<Message> {
+        // Explicit synthetic benchmarks must never start native discovery.
+        if self.stress.is_some() {
+            return Task::none();
+        }
         let all_sources_needed = self
             .chart
             .indicators
@@ -237,6 +673,35 @@ impl Desktop {
             .retain(|(_, scope_product), result| *scope_product != product || result.is_ok());
         self.source_catalog_generation = self.source_catalog_generation.wrapping_add(1);
         self.source_catalog_pending.clear();
+    }
+
+    pub(crate) fn retry_source_discovery_task(&mut self) -> Task<Message> {
+        let product = self.chart.market.product;
+        let failed = self
+            .source_catalogs
+            .iter()
+            .filter(|((_, scope_product), result)| *scope_product == product && result.is_err())
+            .map(|(scope, _)| *scope)
+            .collect::<Vec<_>>();
+        if failed.is_empty() {
+            return Task::none();
+        }
+        let pending = self
+            .source_catalog_pending
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        self.retry_source_discovery();
+        let mut tasks = Vec::new();
+        for (exchange, product) in failed {
+            tasks.push(self.retry_source_catalog_scope(exchange, product));
+        }
+        for (exchange, product) in pending {
+            tasks.push(self.retry_source_catalog_scope(exchange, product));
+        }
+        self.revalidate_all_sources();
+        self.refresh_source_panes();
+        Task::batch(tasks)
     }
 
     pub(crate) fn revalidate_all_sources(&mut self) {
@@ -369,6 +834,10 @@ impl Desktop {
     }
 
     pub(crate) fn source_subscription(&self) -> Subscription<Message> {
+        // Benchmark isolation is not an alternate live-data fallback.
+        if self.stress.is_some() {
+            return Subscription::none();
+        }
         Subscription::batch(
             self.source_requests
                 .iter()
@@ -396,6 +865,7 @@ impl Desktop {
             .source_requests
             .get(&(batch.scope.market.clone(), batch.scope.kind))
             .is_some_and(|request| request.generation == batch.scope.generation)
+            || batch.scope.base_asset != self.chart.base_asset
         {
             return;
         }
@@ -404,6 +874,19 @@ impl Desktop {
         };
         let now = now_ms();
         for event in batch.events.into_vec() {
+            let matches_kind = match &event {
+                source_feeds::Event::Metadata { .. } => true,
+                source_feeds::Event::Market(_) | source_feeds::Event::History(_) => {
+                    batch.scope.kind == source_feeds::Kind::Cvd
+                }
+                source_feeds::Event::OpenInterest(_)
+                | source_feeds::Event::HistoryProblem { .. } => {
+                    batch.scope.kind == source_feeds::Kind::OpenInterest
+                }
+            };
+            if !matches_kind {
+                continue;
+            }
             match event {
                 source_feeds::Event::Metadata { base_asset } => {
                     if source.base_asset != base_asset {
@@ -542,7 +1025,9 @@ fn oi_status(source: &mut SourceData, connected: bool, message: String) {
 mod tests {
     use super::*;
     use mexc_indicators::{IndicatorSet, SourceMode};
-    use mexc_model::{FlowSupport, OpenInterestSample, OpenInterestTimestamp, Quote};
+    use mexc_model::{
+        FlowQuality, FlowSupport, OpenInterestSample, OpenInterestTimestamp, Quote, VolumeFlow,
+    };
 
     fn market(exchange: Exchange) -> Market {
         Market {
@@ -570,6 +1055,7 @@ mod tests {
                 quote_coin: Quote::USDT,
                 settle_coin: "USDT".into(),
                 price_scale: 2,
+                tick_size: None,
                 contract_size: 1.0,
                 inverse: false,
                 volume_unit: "BTC".into(),
@@ -967,5 +1453,252 @@ mod tests {
             assert_eq!(retained.oi[0].quantity, quantity);
             assert_eq!(retained.oi_cadence_ms, Some(1_000));
         }
+    }
+
+    #[test]
+    fn diagnostics_distinguish_stale_observed_oi_from_disconnection_and_historical_proof() {
+        let mut input = SourceData::new(market(Exchange::Binance), "BTC".into());
+        input.oi_connected = true;
+        input.oi_cadence_ms = Some(1_000);
+        input.merge_oi(&[OpenInterestSample {
+            timestamp_ms: 1_000,
+            quantity: 2.0,
+            interval_ms: 60_000,
+            timestamp_source: OpenInterestTimestamp::Observed,
+        }]);
+        assert_eq!(
+            input.diagnostics(true, None, 4_000).condition,
+            SourceCondition::Current
+        );
+        let stale = input.diagnostics(true, None, 4_001);
+        assert_eq!(stale.condition, SourceCondition::Stale);
+        assert_eq!(stale.asof_ms, Some(1_000));
+        assert_eq!(
+            stale.timestamp_source,
+            Some(OpenInterestTimestamp::Observed)
+        );
+        input.oi_connected = false;
+        assert_eq!(
+            input.diagnostics(true, None, 1_000).condition,
+            SourceCondition::Disconnected
+        );
+        assert_eq!(input.oi[0].quantity, 2.0);
+        input.oi_connected = true;
+        assert_eq!(
+            input.diagnostics(true, None, 999).condition,
+            SourceCondition::Stale
+        );
+    }
+
+    #[test]
+    fn flow_diagnostics_keep_stale_finalized_proof_distinct_from_current_revoked_coverage() {
+        let mut input = SourceData::new(market(Exchange::Binance), "BTC".into());
+        input.flow_connected = true;
+        input.merge_flows(
+            &[FlowBar {
+                time: 0,
+                flow: VolumeFlow {
+                    delta: Some(2.0),
+                    volume: Some(2.0),
+                    quality: FlowQuality::Exact,
+                    covered_from: 0,
+                    through_ms: 300_000,
+                },
+            }],
+            false,
+        );
+        assert_eq!(
+            input.diagnostics(false, Some(0), 300_001).condition,
+            SourceCondition::Stale
+        );
+        assert_eq!(input.flows[&0].delta, Some(2.0));
+        input.merge_flows(
+            &[FlowBar {
+                time: 300,
+                flow: VolumeFlow {
+                    delta: Some(1.0),
+                    volume: Some(1.0),
+                    quality: FlowQuality::Reported,
+                    covered_from: 300,
+                    through_ms: 301_000,
+                },
+            }],
+            true,
+        );
+        assert_eq!(
+            input.diagnostics(false, Some(300), 301_000).condition,
+            SourceCondition::Current
+        );
+        flow_status(&mut input, false, "offline".into(), 301_000);
+        assert_eq!(
+            input.diagnostics(false, Some(300), 301_000).condition,
+            SourceCondition::Disconnected
+        );
+        assert_eq!(input.flows[&0].delta, Some(2.0));
+        input.flow_connected = true;
+        assert_eq!(
+            input.diagnostics(false, Some(300), 301_000).condition,
+            SourceCondition::IncompleteCoverage
+        );
+        assert_eq!(input.flows[&300].quality, FlowQuality::Missing);
+    }
+
+    #[test]
+    fn contributor_retry_preserves_other_kinds_markets_and_rejects_old_or_wrong_kind_batches() {
+        let (mut desktop, _) = Desktop::new();
+        desktop.chart.market = market(Exchange::Binance);
+        desktop.chart.base_asset = "BTC".into();
+        desktop.chart.indicators = IndicatorSet::default();
+        let selected = market(Exchange::Okx);
+        let unrelated = market(Exchange::Mexc);
+        let selection = IndicatorSource {
+            mode: SourceMode::Selected,
+            markets: vec![selected.clone(), unrelated.clone()],
+        };
+        let oi_id = desktop
+            .chart
+            .indicators
+            .add(IndicatorSpec::OpenInterest, &[], selected.interval)
+            .unwrap();
+        desktop
+            .chart
+            .indicators
+            .configure_source(oi_id, selection.clone())
+            .unwrap();
+        let cvd_id = desktop
+            .chart
+            .indicators
+            .add(IndicatorKind::Cvd.default_spec(), &[], selected.interval)
+            .unwrap();
+        desktop
+            .chart
+            .indicators
+            .configure_source(cvd_id, selection)
+            .unwrap();
+        for market in [&selected, &unrelated] {
+            let mut input = SourceData::new(market.clone(), "BTC".into());
+            input.flow_connected = true;
+            input.oi_connected = true;
+            input.merge_oi(&[OpenInterestSample {
+                timestamp_ms: 1_000,
+                quantity: 2.0,
+                interval_ms: 1_000,
+                timestamp_source: OpenInterestTimestamp::Venue,
+            }]);
+            desktop.source_inputs.insert(market.clone(), input);
+        }
+        desktop.sync_indicator_sources();
+        let oi_key = (selected.clone(), source_feeds::Kind::OpenInterest);
+        let cvd_key = (selected.clone(), source_feeds::Kind::Cvd);
+        let unrelated_key = (unrelated.clone(), source_feeds::Kind::OpenInterest);
+        let old = desktop.source_requests[&oi_key].generation;
+        let cvd_generation = desktop.source_requests[&cvd_key].generation;
+        let unrelated_generation = desktop.source_requests[&unrelated_key].generation;
+        let unrelated_revision = desktop.source_inputs[&unrelated].revision;
+        let _ = desktop.retry_indicator_contributor(oi_id, &selected);
+        let current = desktop.source_requests[&oi_key].generation;
+        assert_ne!(current, old);
+        assert_eq!(desktop.source_requests[&cvd_key].generation, cvd_generation);
+        assert_eq!(
+            desktop.source_requests[&unrelated_key].generation,
+            unrelated_generation
+        );
+        assert_eq!(
+            desktop.source_inputs[&unrelated].revision,
+            unrelated_revision
+        );
+        assert!(desktop.source_inputs[&selected].flow_connected);
+        assert!(!desktop.source_inputs[&selected].oi_connected);
+        assert_eq!(desktop.source_inputs[&selected].oi[0].quantity, 2.0);
+        for generation in [old, current] {
+            let event = if generation == old {
+                source_feeds::Event::OpenInterest(OpenInterestEvent::Status {
+                    connected: true,
+                    message: "stale response".into(),
+                })
+            } else {
+                source_feeds::Event::Market(MarketEvent::FlowStatus {
+                    connected: false,
+                    message: "wrong data kind".into(),
+                })
+            };
+            desktop.accept_source_batch(source_feeds::Batch {
+                scope: Arc::new(source_feeds::Scope {
+                    market: selected.clone(),
+                    generation,
+                    kind: source_feeds::Kind::OpenInterest,
+                    base_asset: "BTC".into(),
+                }),
+                events: vec![event].into_boxed_slice(),
+            });
+        }
+        assert!(!desktop.source_inputs[&selected].oi_connected);
+        assert!(desktop.source_inputs[&selected].flow_connected);
+        let mut foreign = selected.clone();
+        foreign.symbol = "unselected".into();
+        let _ = desktop.retry_indicator_contributor(oi_id, &foreign);
+        foreign = selected.clone();
+        foreign.interval = Timeframe::Hour8;
+        let _ = desktop.retry_indicator_contributor(oi_id, &foreign);
+        assert_eq!(desktop.source_requests[&oi_key].generation, current);
+        assert_eq!(desktop.source_requests.len(), 4);
+    }
+
+    #[test]
+    fn discovery_retry_requeues_exact_scope_and_pending_generation_without_resetting_inputs() {
+        let (mut desktop, _) = Desktop::new();
+        desktop.chart.market = market(Exchange::Binance);
+        desktop.chart.base_asset = "BTC".into();
+        desktop.chart.indicators = IndicatorSet::default();
+        let id = desktop
+            .chart
+            .indicators
+            .add(IndicatorSpec::OpenInterest, &[], Timeframe::Min5)
+            .unwrap();
+        desktop
+            .chart
+            .indicators
+            .configure_source(id, all_source(&[Exchange::Binance]))
+            .unwrap();
+        desktop.source_catalogs = catalogs();
+        let failed = (Exchange::Okx, Product::Perpetual);
+        let pending = (Exchange::Mexc, Product::Perpetual);
+        desktop.source_catalogs.insert(failed, Err("failed".into()));
+        desktop.source_catalogs.remove(&pending);
+        desktop.source_catalog_pending.insert(pending);
+        desktop.sync_indicator_sources();
+        let requests = desktop
+            .source_requests
+            .iter()
+            .map(|(key, request)| (key.clone(), request.generation))
+            .collect::<HashMap<_, _>>();
+        let generation = desktop.source_catalog_generation;
+        let _ = desktop.retry_indicator_source_discovery(id, failed.0, failed.1);
+        assert_eq!(
+            desktop.source_catalog_generation,
+            generation.wrapping_add(1)
+        );
+        assert!(desktop.source_catalog_pending.contains(&failed));
+        assert!(desktop.source_catalog_pending.contains(&pending));
+        assert!(!desktop.source_catalogs.contains_key(&failed));
+        for (key, generation) in requests {
+            assert_eq!(desktop.source_requests[&key].generation, generation);
+        }
+        let blockers = discovery_blockers(
+            &catalogs(),
+            &PendingCatalogs::new(),
+            &all_source(&[Exchange::Binance, Exchange::Mexc]),
+            IndicatorKind::OpenInterest,
+            &desktop.chart.market,
+            "BTC",
+        );
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].remedy, Remedy::Repair);
+        // Coinbase has no eligible perpetual base-quantity instrument: discovery
+        // completes without turning the unsupported venue into required membership.
+        assert_eq!(
+            blockers[0].kind,
+            BlockerKind::MissingMembership(Exchange::Okx, Product::Perpetual)
+        );
     }
 }

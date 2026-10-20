@@ -1,3 +1,7 @@
+#[path = "binance_executions.rs"]
+mod executions;
+pub use executions::{execution_history, execution_session};
+
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -112,6 +116,11 @@ fn append_symbols(
             .and_then(|f| f.get("tickSize"))
             .and_then(Value::as_str)
             .context("Binance PRICE_FILTER missing tickSize")?;
+        let tick_size = flow::amount(tick).context("invalid Binance native tick increment")?;
+        ensure!(
+            tick_size > rust_decimal::Decimal::ZERO,
+            "nonpositive Binance native tick increment"
+        );
         let price_scale = tick
             .split_once('.')
             .map(|(_, decimals)| decimals.trim_end_matches('0').len() as u32)
@@ -139,6 +148,7 @@ fn append_symbols(
             quote_coin: quote,
             settle_coin: settle,
             price_scale,
+            tick_size: Some(tick_size),
             contract_size,
             inverse,
             volume_unit: if inverse {
@@ -636,6 +646,32 @@ mod tests {
             assert_same_candle_fields(&native, &base);
             assert_eq!(base.flow.unwrap().delta, native.flow.unwrap().delta);
             assert_eq!(base.flow.unwrap().volume, native.flow.unwrap().volume);
+        }
+    }
+
+    #[test]
+    fn catalog_retains_authoritative_tick_not_price_precision() {
+        for (product, inverse, tick, expected_scale) in [
+            (Product::Spot, false, "0.25000000", 2),
+            (Product::Perpetual, false, "0.00001000", 5),
+            (Product::Perpetual, true, "5.00000000", 0),
+        ] {
+            let mut response = serde_json::json!({"symbols":[{
+                "symbol":"BTCUSDT", "status":"TRADING", "contractStatus":"TRADING",
+                "contractType":"PERPETUAL", "baseAsset":"BTC", "quoteAsset":"USDT",
+                "marginAsset":"BTC", "contractSize":100, "pricePrecision":8,
+                "filters":[{"filterType":"PRICE_FILTER","tickSize":tick}]
+            }]});
+            let mut instruments = Vec::new();
+            append_symbols(&mut instruments, &response, product, inverse).unwrap();
+            assert_eq!(instruments.len(), 1);
+            assert_eq!(
+                instruments[0].tick_size,
+                Some(rust_decimal::Decimal::from_str_exact(tick).unwrap())
+            );
+            assert_eq!(instruments[0].price_scale, expected_scale);
+            response["symbols"][0]["filters"][0]["tickSize"] = Value::String("0".into());
+            assert!(append_symbols(&mut Vec::new(), &response, product, inverse).is_err());
         }
     }
 

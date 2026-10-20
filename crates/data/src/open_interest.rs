@@ -762,6 +762,7 @@ mod tests {
             quote_coin: Quote::USDT,
             settle_coin: "BTC".into(),
             price_scale: 1,
+            tick_size: None,
             contract_size: 100.0,
             inverse,
             volume_unit: "contracts".into(),

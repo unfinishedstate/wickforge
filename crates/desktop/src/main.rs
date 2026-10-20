@@ -1,4 +1,6 @@
 mod chart;
+mod chart_surface;
+mod command_palette;
 mod drawing_controls;
 mod drawing_geometry;
 mod drawing_interaction;
@@ -6,16 +8,27 @@ mod drawing_layer;
 mod drawing_types;
 mod drawings;
 mod feeds;
+mod goto_time;
 mod history;
 mod indicator_manager;
 mod key_help;
 mod market_selector;
 mod palette;
 mod pane_resize;
+mod pointer_input;
 mod presentation;
+mod profile_controls;
+mod profile_layer;
+mod profiles_runtime;
 mod source_controller;
 mod source_feeds;
 mod state;
+mod stress;
+mod ui;
+mod workspace;
+mod workspace_controls;
+mod workspace_runtime;
+mod workspace_store;
 
 use arrayvec::ArrayVec;
 use drawing_types::{Command as DrawingCommand, DrawingId, Tool as DrawingTool};
@@ -25,7 +38,11 @@ use iced::widget::{
 };
 use iced::{Element, Length, Subscription, Task, Theme, keyboard};
 use mexc_data::DataService;
+use mexc_indicators::profiles::{
+    Instance as ProfileInstance, Range as ProfileRangeSpec, Spec as ProfileSpec,
+};
 use mexc_indicators::{IndicatorSource, IndicatorSpec, SourceData};
+use mexc_model::executions::NativeInstrument;
 use mexc_model::{
     Catalog, Exchange, FlowBar, HistoryEvent, HistoryPage, Market, MarketEvent, OpenInterestEvent,
     OpenInterestPage, OpenInterestSample, Product, Quote, Timeframe,
@@ -34,10 +51,24 @@ use state::{Action, ChartState};
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 enum Message {
+    Workspace(workspace_controls::Event),
+    WorkspacePoll,
+    WorkspaceSaved {
+        revision: u64,
+        result: Result<workspace_store::SaveResult, String>,
+    },
+    WorkspaceResetDone {
+        revision: u64,
+        kind: workspace::ResetKind,
+        snapshot: Arc<workspace::Snapshot>,
+        result: Result<workspace_store::SaveResult, String>,
+    },
+    CloseRequested(iced::window::Id),
+    PointerCancelled,
     Action(Action),
     DrawingInput {
         generation: u64,
@@ -66,6 +97,24 @@ enum Message {
     ModalBackdrop,
     UseChartSource(u64),
     RetryIndicatorSources(u64),
+    RetryContributor {
+        id: u64,
+        market: Market,
+    },
+    RetrySourceDiscovery {
+        id: u64,
+        exchange: Exchange,
+        product: Product,
+    },
+    CommandOpen,
+    CommandFocused(Option<iced::advanced::widget::Id>),
+    CommandPalette(command_palette::Event),
+    GotoTimeOpen,
+    GotoTime(goto_time::Event),
+    QuickMarket(Market),
+    StressPulse,
+    StressFrame(Instant),
+    StressFinish,
     Key {
         key: keyboard::Key,
         modifiers: keyboard::Modifiers,
@@ -115,6 +164,10 @@ enum Message {
         result: Result<Arc<Catalog>, String>,
     },
     SourceData(source_feeds::Batch),
+    Profile(profile_controls::Event),
+    ProfileEntry(indicator_manager::ProfileEntry),
+    ProfileEdit(profile_layer::Edit),
+    ProfileData(profiles_runtime::Event),
     Tick,
 }
 
@@ -124,22 +177,45 @@ enum Details {
     Indicator(u64),
 }
 
+struct ProfileRange {
+    id: Option<u64>,
+    spec: ProfileSpec,
+    first: Option<i64>,
+    cursor_ms: i64,
+}
+
 struct Desktop {
     chart: ChartState,
     cache: canvas::Cache,
     pane_caches: BTreeMap<u64, canvas::Cache>,
     drawings: drawings::Store,
     drawing_interaction: drawing_interaction::Interaction,
+    pointer_generation: u64,
     drawing_controls: drawing_controls::Controls,
     drawing_scene: drawing_layer::Scene,
     drawing_projection: Cell<Option<drawing_geometry::Projection>>,
     drawing_error: Option<String>,
     manager: indicator_manager::Manager,
+    profiles: profiles_runtime::Runtime,
+    profile_controls: profile_controls::Controls,
+    profile_scene: profile_layer::Scene,
+    profile_range: Option<ProfileRange>,
+    selected_profile: Option<u64>,
+    next_profile_id: u64,
     selector: market_selector::Selector,
     active_catalog: Option<Arc<Catalog>>,
     help_open: bool,
     help_selection: usize,
     details: Option<Details>,
+    commands: Option<command_palette::Commands>,
+    command_focus: Option<iced::advanced::widget::Id>,
+    command_pending: bool,
+    goto_time: goto_time::Editor,
+    goto_target: Option<i64>,
+    goto_page_oldest: Option<i64>,
+    goto_notice: Option<String>,
+    vwap_backfill_cursor: Option<(u64, i64)>,
+    stress: Option<stress::Metrics>,
     theme_file: palette::ThemeFile,
     data: DataService,
     market_generation: u64,
@@ -158,6 +234,7 @@ struct Desktop {
     source_requests: source_controller::Requests,
     source_inputs: HashMap<Market, SourceData>,
     next_source_generation: u64,
+    workspace: workspace_runtime::Session,
 }
 
 impl Desktop {
@@ -171,16 +248,32 @@ impl Desktop {
             pane_caches: BTreeMap::new(),
             drawings,
             drawing_interaction: Default::default(),
+            pointer_generation: 0,
             drawing_controls: Default::default(),
             drawing_scene: Default::default(),
             drawing_projection: Cell::new(None),
             drawing_error: None,
             manager: indicator_manager::Manager::default(),
+            profiles: Default::default(),
+            profile_controls: Default::default(),
+            profile_scene: Default::default(),
+            profile_range: None,
+            selected_profile: None,
+            next_profile_id: 1,
             selector: market_selector::Selector::default(),
             active_catalog: None,
             help_open: false,
             help_selection: 0,
             details: None,
+            commands: None,
+            command_focus: None,
+            command_pending: false,
+            goto_time: Default::default(),
+            goto_target: None,
+            goto_page_oldest: None,
+            goto_notice: None,
+            vwap_backfill_cursor: None,
+            stress: stress::Scenario::from_args().map(stress::Metrics::new),
             theme_file: palette::ThemeFile::new(),
             data,
             catalog_generation: 0,
@@ -199,12 +292,528 @@ impl Desktop {
             source_requests: Default::default(),
             source_inputs: Default::default(),
             next_source_generation: 0,
+            workspace: Default::default(),
         };
+        desktop.selector.observe_market(&desktop.chart.market);
+        if let Some(metrics) = &desktop.stress {
+            stress::populate(
+                &mut desktop.chart,
+                &mut desktop.drawings,
+                &mut desktop.pane_caches,
+                metrics.scenario,
+            );
+            desktop.native_quote = "synthetic price".into();
+            desktop.native_volume_unit = "synthetic units".into();
+            desktop.status = "Synthetic benchmark fixture; native feeds are disabled".into();
+            return (
+                desktop,
+                Task::perform(
+                    async {
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                    },
+                    |_| Message::StressFinish,
+                ),
+            );
+        }
         let startup = Task::batch([
             desktop.fetch(Request::Recent),
             desktop.load_catalog(desktop.chart.market.exchange, desktop.chart.market.product),
         ]);
         (desktop, startup)
+    }
+
+    fn profile_tick(&self) -> Option<rust_decimal::Decimal> {
+        self.active_catalog
+            .as_deref()?
+            .instruments
+            .iter()
+            .find(|instrument| {
+                instrument.exchange == self.chart.market.exchange
+                    && instrument.product == self.chart.market.product
+                    && instrument.symbol == self.chart.market.symbol
+            })
+            .and_then(|instrument| instrument.tick_size)
+    }
+
+    fn sync_profiles(&mut self) {
+        if self.workspace.waiting_market || self.stress.is_some() || self.chart.latest().is_none() {
+            return;
+        }
+        let before = self.profiles.revision;
+        let view = self.chart.viewport;
+        let tick = self.profile_tick();
+        self.profiles.sync(
+            &self.chart.market,
+            tick,
+            &self.chart.profiles,
+            (
+                (view.left * 1000.0) as i64,
+                ((view.left + view.span) * 1000.0) as i64,
+            ),
+        );
+        if before != self.profiles.revision {
+            self.profile_statuses();
+        }
+    }
+
+    fn profile_statuses(&mut self) {
+        if !self.profile_controls.open {
+            return;
+        }
+        for instance in &self.chart.profiles {
+            if let Some(bound) = &instance.instrument
+                && (bound.exchange != self.chart.market.exchange
+                    || bound.product != self.chart.market.product
+                    || bound.symbol != self.chart.market.symbol)
+            {
+                self.profile_controls.set_status(instance.id, Some(format!(
+                    "Dormant: bound to {} · {} · {}. Switch to that native instrument to compute; no source is substituted.",
+                    bound.exchange, bound.product, bound.symbol)));
+                continue;
+            }
+            let status = self.profiles.errors.get(&instance.id).cloned().or_else(|| {
+                self.profiles
+                    .outputs
+                    .get(&instance.id)
+                    .and_then(|rows| rows.last())
+                    .and_then(|profile| profile.reason.clone())
+            });
+            let source = self.profiles.sources.status(instance.spec.kind);
+            let status = Some(format!(
+                "{}History: {} · Live: {}",
+                status.map_or(String::new(), |value| format!("{value} · ")),
+                source.history,
+                source.live
+            ));
+            let status = if instance.spec.kind == mexc_indicators::profiles::Kind::Volume {
+                Some(format!(
+                    "Native volume unit: {}{}",
+                    self.native_volume_unit,
+                    status
+                        .as_ref()
+                        .map_or(String::new(), |value| format!(" · {value}"))
+                ))
+            } else {
+                status
+            };
+            self.profile_controls.set_status(instance.id, status);
+        }
+    }
+
+    fn profile_inspection(&self) -> Option<Element<'static, Message>> {
+        if self.chart.active_pane.is_some() {
+            return None;
+        }
+        let (time, price) = self.chart.inspection?;
+        let tick = rust_decimal::prelude::ToPrimitive::to_f64(&self.profile_tick()?)?;
+        let mut values = row![].spacing(8);
+        let mut count = 0;
+        for instance in self
+            .chart
+            .profiles
+            .iter()
+            .filter(|instance| instance.visible)
+        {
+            let Some(snapshots) = self.profiles.outputs.get(&instance.id) else {
+                continue;
+            };
+            let snapshot = match instance.spec.range {
+                ProfileRangeSpec::Session(_) => snapshots.iter().find(|profile| {
+                    profile.start_ms <= time.saturating_mul(1000)
+                        && profile.end_ms > time.saturating_mul(1000)
+                }),
+                _ => snapshots.last(),
+            };
+            let Some(profile) = snapshot else {
+                continue;
+            };
+            let at = profile.rows.partition_point(|row| row.low <= price);
+            let Some(value) = at
+                .checked_sub(1)
+                .and_then(|index| profile.rows.get(index))
+                .filter(|row| price < row.high + tick)
+            else {
+                continue;
+            };
+            let quantity = if instance.spec.kind == mexc_indicators::profiles::Kind::Tpo {
+                format!("{} blocks", value.blocks.len())
+            } else {
+                format!(
+                    "{} {}",
+                    presentation::quantity(value.weight),
+                    self.native_volume_unit
+                )
+            };
+            values = values.push(
+                text(format!(
+                    "#{} {} · {}{}",
+                    instance.id,
+                    instance.spec.kind,
+                    quantity,
+                    match profile.volume_method {
+                        mexc_indicators::profiles::VolumeMethod::Estimated => " · estimated",
+                        mexc_indicators::profiles::VolumeMethod::Mixed => " · mixed",
+                        _ if !profile.covered => " · observed",
+                        _ => "",
+                    }
+                ))
+                .size(11)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .style(ui::muted_text),
+            );
+            count += 1;
+        }
+        (count > 0).then(|| values.into())
+    }
+
+    fn reset_profile_runtime(&mut self) {
+        self.profiles.reset();
+        self.profile_scene.clear();
+        self.profile_controls = Default::default();
+        self.profile_range = None;
+        self.selected_profile = None;
+        self.next_profile_id = self
+            .chart
+            .profiles
+            .iter()
+            .map(|instance| instance.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.pointer_generation = self.pointer_generation.wrapping_add(1);
+    }
+
+    fn put_profile(
+        &mut self,
+        id: Option<u64>,
+        spec: ProfileSpec,
+        placed: bool,
+    ) -> Result<u64, String> {
+        spec.validate()?;
+        let key = NativeInstrument::from_market(&self.chart.market);
+        let id = if let Some(id) = id {
+            let instance = self
+                .chart
+                .profiles
+                .iter_mut()
+                .find(|instance| instance.id == id)
+                .ok_or("This profile was removed")?;
+            let binding = if matches!(spec.range, ProfileRangeSpec::Fixed { .. }) {
+                if placed {
+                    Some(key)
+                } else {
+                    instance.instrument.clone().or(Some(key))
+                }
+            } else {
+                None
+            };
+            instance.spec = spec;
+            instance.instrument = binding;
+            id
+        } else {
+            let id = self.next_profile_id;
+            let next = id
+                .checked_add(1)
+                .filter(|_| id != 0)
+                .ok_or("Profile IDs are exhausted")?;
+            self.next_profile_id = next;
+            let instrument = matches!(spec.range, ProfileRangeSpec::Fixed { .. }).then_some(key);
+            self.chart.profiles.push(ProfileInstance {
+                id,
+                spec,
+                visible: true,
+                instrument,
+            });
+            id
+        };
+        self.workspace.mark_dirty();
+        self.profile_scene.clear();
+        self.profile_controls.applied(&self.chart.profiles, id);
+        Ok(id)
+    }
+
+    fn profile_entry(&mut self, entry: indicator_manager::ProfileEntry) -> Task<Message> {
+        use indicator_manager::ProfileEntry;
+        use mexc_indicators::profiles::Kind;
+        if self.help_open || self.workspace.controls.is_open() || self.goto_time.open {
+            return Task::none();
+        }
+        let kind = if matches!(entry, ProfileEntry::Tpo) {
+            Kind::Tpo
+        } else {
+            Kind::Volume
+        };
+        let _ = self.profile_event(profile_controls::Event::New(kind));
+        if self.profile_tick().is_none() {
+            self.profile_controls.set_error(
+                "Native tick-size metadata is unavailable; no price increment will be guessed."
+                    .into(),
+            );
+            return self.profile_controls.focus();
+        }
+        if matches!(entry, ProfileEntry::SelectedVolume) {
+            let _ = self.profile_event(profile_controls::Event::Mode(
+                profile_controls::RangeMode::Fixed,
+            ));
+            return self.profile_event(profile_controls::Event::PlaceRange);
+        }
+        if matches!(entry, ProfileEntry::VisibleVolume) {
+            let _ = self.profile_event(profile_controls::Event::Mode(
+                profile_controls::RangeMode::Visible,
+            ));
+        }
+        self.profile_event(profile_controls::Event::Apply)
+    }
+
+    fn edit_profile(&mut self, edit: profile_layer::Edit) -> Task<Message> {
+        if self.help_open
+            || self.workspace.controls.is_open()
+            || self.goto_time.open
+            || self.manager.open
+            || self.selector.open
+            || self.profile_controls.open
+        {
+            return Task::none();
+        }
+        let id = match edit {
+            profile_layer::Edit::Select(id) | profile_layer::Edit::Range { id, .. } => id,
+        };
+        if self.profile_bound_elsewhere(id) {
+            self.profile_controls.show(&self.chart.profiles, Some(id));
+            self.profile_controls.set_error(
+                "Switch to this fixed profile's bound native instrument before editing its range."
+                    .into(),
+            );
+            return self.profile_controls.focus();
+        }
+        let Some(instance) = self.chart.profiles.iter().find(|instance| {
+            instance.id == id && matches!(instance.spec.range, ProfileRangeSpec::Fixed { .. })
+        }) else {
+            return Task::none();
+        };
+        let mut spec = instance.spec.clone();
+        if let profile_layer::Edit::Range {
+            start_ms, end_ms, ..
+        } = edit
+        {
+            spec.range = ProfileRangeSpec::Fixed { start_ms, end_ms };
+            if let Err(error) = self.put_profile(Some(id), spec, false) {
+                self.profile_controls.set_error(error);
+                return Task::none();
+            }
+        }
+        self.selected_profile = Some(id);
+        self.drawing_controls.close();
+        self.drawing_interaction.choose_tool(DrawingTool::Select);
+        self.drawings.select(None);
+        self.chart.dispatch(Action::ActivatePane(None));
+        Task::none()
+    }
+
+    fn profile_point(&mut self, time_ms: i64) -> Task<Message> {
+        let Some(placement) = &mut self.profile_range else {
+            return Task::none();
+        };
+        let time_ms = if placement.spec.kind == mexc_indicators::profiles::Kind::Tpo {
+            time_ms.div_euclid(60_000).saturating_mul(60_000)
+        } else {
+            time_ms
+        };
+        placement.cursor_ms = time_ms;
+        let Some(first) = placement.first else {
+            placement.first = Some(time_ms);
+            return Task::none();
+        };
+        if first == time_ms {
+            return Task::none();
+        }
+        let mut placement = self.profile_range.take().unwrap();
+        placement.spec.range = ProfileRangeSpec::Fixed {
+            start_ms: first.min(time_ms),
+            end_ms: first.max(time_ms),
+        };
+        match self.put_profile(placement.id, placement.spec, true) {
+            Ok(id) => self.selected_profile = Some(id),
+            Err(error) => self.profile_controls.set_error(error),
+        }
+        self.pointer_generation = self.pointer_generation.wrapping_add(1);
+        Task::none()
+    }
+
+    fn profile_bound_elsewhere(&self, id: u64) -> bool {
+        self.chart
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .and_then(|profile| profile.instrument.as_ref())
+            .is_some_and(|bound| {
+                bound.exchange != self.chart.market.exchange
+                    || bound.product != self.chart.market.product
+                    || bound.symbol != self.chart.market.symbol
+            })
+    }
+
+    fn profile_event(&mut self, event: profile_controls::Event) -> Task<Message> {
+        use profile_controls::{Command, Event};
+        if self.help_open || self.workspace.controls.is_open() {
+            return Task::none();
+        }
+        if let Event::RangePoint(time_ms) = event {
+            return self.profile_point(time_ms);
+        }
+        if let Event::RangeCursor(time_ms) = event {
+            if let Some(placement) = &mut self.profile_range {
+                placement.cursor_ms = if placement.spec.kind == mexc_indicators::profiles::Kind::Tpo
+                {
+                    time_ms.div_euclid(60_000).saturating_mul(60_000)
+                } else {
+                    time_ms
+                };
+            }
+            return Task::none();
+        }
+        if matches!(event, Event::RangeCancel) {
+            self.profile_range = None;
+            self.pointer_generation = self.pointer_generation.wrapping_add(1);
+            return Task::none();
+        }
+        if matches!(event, Event::Open(_) | Event::New(_)) {
+            self.profile_range = None;
+            self.drawing_interaction.cancel();
+            self.drawing_controls.close();
+            self.manager.open = false;
+            self.selector.open = false;
+            self.details = None;
+            self.goto_time.open = false;
+            self.pointer_generation = self.pointer_generation.wrapping_add(1);
+        }
+        let quick = matches!(event, Event::QuickAdd(_));
+        let focus = matches!(
+            event,
+            Event::Open(_)
+                | Event::New(_)
+                | Event::Select(_)
+                | Event::Kind(_)
+                | Event::Mode(_)
+                | Event::Period(_)
+        );
+        let suggest = matches!(event, Event::New(_))
+            || matches!(event, Event::Open(None)) && self.chart.profiles.is_empty();
+        let command = self.profile_controls.update(event, &self.chart.profiles);
+        if suggest && let Some(tick) = self.profile_tick() {
+            self.profile_controls
+                .suggest_rows(profiles_runtime::suggested_rows(tick, self.chart.candles()));
+        }
+        let result: Result<(), String> = match command {
+            Some(Command::Rebin(id) | Command::PlaceRange { id: Some(id), .. })
+                if self.profile_bound_elsewhere(id) => {
+                Err("Switch to this fixed profile's bound native instrument before rebinning or placing its range".into())
+            }
+            Some(Command::Add(mut spec)) => {
+                if quick {
+                    if let Some(tick) = self.profile_tick() {
+                        spec.ticks_per_row =
+                            profiles_runtime::suggested_rows(tick, self.chart.candles());
+                    } else {
+                        self.profile_controls
+                            .update(Event::New(spec.kind), &self.chart.profiles);
+                        self.profile_controls.set_error("Native tick-size metadata is unavailable; no price increment will be guessed.".into());
+                        return Task::none();
+                    }
+                }
+                self.put_profile(None, spec, false).map(|_| ())
+            }
+            Some(Command::Apply { id, spec }) => {
+                self.put_profile(Some(id), spec, false).map(|_| ())
+            }
+            Some(Command::Delete(id)) => {
+                if self.selected_profile == Some(id) { self.selected_profile = None; }
+                let before = self.chart.profiles.len();
+                self.chart.profiles.retain(|instance| instance.id != id);
+                if before != self.chart.profiles.len() {
+                    self.workspace.mark_dirty();
+                    self.profile_scene.clear();
+                }
+                Ok(())
+            }
+            Some(Command::SetVisible { id, visible }) => {
+                if let Some(instance) = self
+                    .chart
+                    .profiles
+                    .iter_mut()
+                    .find(|instance| instance.id == id)
+                    && instance.visible != visible
+                {
+                    instance.visible = visible;
+                    self.workspace.mark_dirty();
+                    self.profile_scene.clear();
+                }
+                Ok(())
+            }
+            Some(Command::Rebin(id)) => {
+                if let Some(tick) = self.profile_tick() {
+                    let width = profiles_runtime::suggested_rows(tick, self.chart.candles());
+                    let spec = self
+                        .chart
+                        .profiles
+                        .iter()
+                        .find(|instance| instance.id == id)
+                        .map(|instance| {
+                            let mut spec = instance.spec.clone();
+                            spec.ticks_per_row = width;
+                            spec
+                        });
+                    match spec {
+                        Some(spec) => self.put_profile(Some(id), spec, false).map(|_| ()),
+                        None => Err("This profile was removed".into()),
+                    }
+                } else {
+                    Err("Authoritative tick-size metadata is unavailable".into())
+                }
+            }
+            Some(Command::PlaceRange { id, spec }) => {
+                if let Some(candle) = self.chart.inspected().or_else(|| self.chart.latest()) {
+                    let cursor_ms = candle.time.saturating_mul(1000);
+                    self.drawing_interaction.cancel();
+                    self.drawing_controls.close();
+                    self.profile_controls.open = false;
+                    self.profile_scene.clear();
+                    self.chart.dispatch(Action::ActivatePane(None));
+                    self.profile_range = Some(ProfileRange {
+                        id,
+                        spec,
+                        first: None,
+                        cursor_ms,
+                    });
+                    self.pointer_generation = self.pointer_generation.wrapping_add(1);
+                    Ok(())
+                } else {
+                    Err("Wait for native candles before placing a profile range".into())
+                }
+            }
+            Some(Command::Retry) => {
+                self.profiles.retry();
+                Ok(())
+            }
+            Some(Command::Focus { backwards }) => {
+                let task = if backwards {
+                    iced::widget::focus_previous()
+                } else {
+                    iced::widget::focus_next()
+                };
+                return task.chain(profile_controls::Controls::reveal_focus());
+            }
+            Some(Command::Scroll(amount)) => return profile_controls::Controls::scroll(amount),
+            None => Ok(()),
+        };
+        if let Err(error) = result {
+            self.profile_controls.set_error(error);
+        }
+        self.profile_statuses();
+        if focus && self.profile_controls.open {
+            return self.profile_controls.focus_visible();
+        }
+        Task::none()
     }
 
     fn has_cvd(&self) -> bool {
@@ -284,6 +893,9 @@ impl Desktop {
     }
 
     fn fetch(&mut self, request: Request) -> Task<Message> {
+        if self.stress.is_some() {
+            return Task::none();
+        }
         self.history.in_flight = true;
         self.history.failed = None;
         self.history.error = None;
@@ -338,15 +950,34 @@ impl Desktop {
     }
 
     fn load_catalog(&mut self, exchange: Exchange, product: Product) -> Task<Message> {
+        self.catalog_request(exchange, product, false)
+    }
+
+    fn retry_catalog(&mut self, exchange: Exchange, product: Product) -> Task<Message> {
+        self.catalog_request(exchange, product, true)
+    }
+
+    fn catalog_request(
+        &mut self,
+        exchange: Exchange,
+        product: Product,
+        retry: bool,
+    ) -> Task<Message> {
+        if self.stress.is_some() {
+            return Task::none();
+        }
         self.catalog_generation = self.catalog_generation.wrapping_add(1);
         self.selector.begin_catalog();
         let generation = self.catalog_generation;
         let data = self.data.clone();
         Task::perform(
             async move {
-                data.catalog(exchange, product)
-                    .await
-                    .map_err(|error| format!("{error:#}"))
+                let result = if retry {
+                    data.retry_catalog(exchange, product).await
+                } else {
+                    data.catalog(exchange, product).await
+                };
+                result.map_err(|error| format!("{error:#}"))
             },
             move |result| Message::Catalog {
                 exchange,
@@ -415,6 +1046,20 @@ impl Desktop {
             self.chart.next_before = None;
         }
         self.chart.merge_page(&page, epoch);
+        if !self.chart.candles().is_empty()
+            && let Some(view) = self.workspace.restored_view.take()
+        {
+            if let Err(error) = self.chart.reapply_workspace_view(&view) {
+                self.workspace.error = Some(error);
+            }
+            if !view.live {
+                self.goto_target = view.left.map(|left| left.floor() as i64);
+                if let Some(target) = self.goto_target {
+                    let _ = self.goto_time.show(target);
+                    self.goto_time.open = false;
+                }
+            }
+        }
         self.update_source_history_target();
         self.clear_geometry();
         self.history.page = Some(page);
@@ -441,6 +1086,16 @@ impl Desktop {
             );
             return Task::none();
         };
+        if matches!(request, Request::Older { .. })
+            && self.goto_target.is_some()
+            && self
+                .goto_page_oldest
+                .take()
+                .is_some_and(|previous| self.chart.oldest().is_none_or(|oldest| oldest >= previous))
+        {
+            self.goto_target = None;
+            return self.goto_time.reject("Native history did not advance toward the requested UTC time; no missing candles were fabricated.");
+        }
         if self.history.pending_sync {
             self.history.pending_sync = false;
             return self.fetch(Request::Recent);
@@ -470,6 +1125,9 @@ impl Desktop {
         if !matches!(request, Request::Older { .. }) {
             self.history.anchor = None;
         }
+        if self.goto_target.is_some() {
+            return self.continue_goto();
+        }
         if self.chart.needs_older() {
             return self.older();
         }
@@ -485,6 +1143,58 @@ impl Desktop {
         } else {
             Task::none()
         }
+    }
+
+    fn vwap_history_origin(&self) -> Option<i64> {
+        let latest = self.chart.latest()?.time.saturating_mul(1000);
+        let visible = (self.chart.viewport.left * 1000.0) as i64;
+        let mut origin = None;
+        for instance in &self.chart.indicators.instances {
+            if let IndicatorSpec::Vwap { reset } = instance.spec {
+                for time in [visible.min(latest), latest] {
+                    let start = mexc_indicators::profiles::period_bounds(reset, time)
+                        .0
+                        .div_euclid(1000);
+                    origin = Some(origin.map_or(start, |old: i64| old.min(start)));
+                }
+            }
+        }
+        for drawing in self.drawings.objects() {
+            if let drawing_types::Shape::AnchoredVwap(at) = drawing.shape {
+                let start = at.utc_ms.div_euclid(1000);
+                origin = Some(origin.map_or(start, |old| old.min(start)));
+            }
+        }
+        origin
+    }
+
+    /// Load the actual origin without moving the viewport or fabricating bars.
+    /// A nonadvancing native cursor is not retried on every UI/live update.
+    fn backfill_vwap_origin(&mut self) -> Option<Task<Message>> {
+        if self.stress.is_some()
+            || self.workspace.waiting_market
+            || !self.chart.initialized
+            || self.goto_target.is_some()
+            || self.history.in_flight
+            || self.history.failed.is_some()
+        {
+            return None;
+        }
+        let origin = self.vwap_history_origin()?;
+        if self.chart.oldest()? <= origin {
+            return None;
+        }
+        let before = self.chart.next_before?;
+        if self
+            .vwap_backfill_cursor
+            .is_some_and(|(generation, previous)| {
+                generation == self.market_generation && before >= previous
+            })
+        {
+            return None;
+        }
+        self.vwap_backfill_cursor = Some((self.market_generation, before));
+        Some(self.older())
     }
 
     fn older(&mut self) -> Task<Message> {
@@ -569,15 +1279,24 @@ impl Desktop {
         let id = next
             .checked_sub(1)
             .and_then(|index| panes().nth(index).map(|instance| instance.id));
+        if self.chart.maximized() && !self.chart.pane_should_render(id) {
+            self.chart.dispatch(Action::TogglePaneMaximized(id));
+        }
         self.chart.dispatch(Action::ActivatePane(id));
+        self.workspace.mark_dirty();
     }
 
     fn drawing_blocked(&self) -> bool {
-        self.help_open
+        self.commands.is_some()
+            || self.command_pending
+            || self.goto_time.open
+            || self.help_open
             || self.manager.open
+            || self.profile_controls.open
             || self.selector.open
             || self.details.is_some()
             || self.drawing_controls.is_open()
+            || self.workspace.controls.is_open()
     }
 
     fn drawing_focus(&self) -> Task<Message> {
@@ -587,9 +1306,13 @@ impl Desktop {
     }
 
     fn commit_drawing(&mut self, command: DrawingCommand) -> bool {
+        let previous = self.drawings.revision();
         match self.drawings.apply(command) {
             Ok(_) => {
                 self.drawing_error = None;
+                if self.drawings.revision() != previous {
+                    self.workspace.mark_dirty();
+                }
                 true
             }
             Err(error) => {
@@ -625,6 +1348,15 @@ impl Desktop {
         }) else {
             return Task::none();
         };
+        let was_waiting = self.workspace.waiting_market;
+        self.workspace.waiting_market = false;
+        self.workspace.restored_view = None;
+        self.selector.observe_market(&market);
+        self.workspace.mark_dirty();
+        self.goto_target = None;
+        self.goto_page_oldest = None;
+        self.goto_time.open = false;
+        self.goto_notice = None;
         let price_scale = instrument.price_scale;
         let native_quote = instrument.quote_coin.to_string();
         let native_volume_unit = instrument.volume_unit.clone();
@@ -632,15 +1364,32 @@ impl Desktop {
         self.active_catalog = Some(catalog);
         self.selector.open = false;
         if market == self.chart.market {
+            if was_waiting {
+                self.chart.price_scale = price_scale;
+                self.chart.base_asset = base_asset;
+                self.native_quote = native_quote;
+                self.native_volume_unit = native_volume_unit;
+                self.sync_indicator_sources();
+                return Task::batch([self.fetch(Request::Recent), self.ensure_source_catalogs()]);
+            }
             return Task::none();
         }
         self.native_quote = native_quote;
         self.native_volume_unit = native_volume_unit;
+        self.pointer_generation = self.pointer_generation.wrapping_add(1);
         self.drawing_interaction.cancel();
+        self.profile_range = None;
+        self.selected_profile = None;
         self.drawing_controls.close();
         self.drawings.switch_context(&market);
         self.drawing_projection.set(None);
         self.drawing_error = None;
+        if NativeInstrument::from_market(&market)
+            != NativeInstrument::from_market(&self.chart.market)
+        {
+            self.profiles.reset();
+            self.profile_scene.clear();
+        }
         self.chart.select_market(market, price_scale);
         self.chart.base_asset = base_asset;
         self.restart_connection();
@@ -653,7 +1402,11 @@ impl Desktop {
 
     fn close_help(&mut self) -> Task<Message> {
         self.help_open = false;
-        if self.manager.open {
+        if self.goto_time.open {
+            self.goto_time.focus()
+        } else if self.profile_controls.open {
+            self.profile_controls.focus()
+        } else if self.manager.open {
             self.manager.show()
         } else if self.selector.open {
             iced::widget::text_input::focus("market-search")
@@ -663,11 +1416,131 @@ impl Desktop {
             Task::none()
         }
     }
+
+    fn close_commands(&mut self) -> Task<Message> {
+        self.commands = None;
+        self.command_pending = false;
+        self.command_focus.take().map_or_else(Task::none, |id| {
+            iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::focus::<
+                Message,
+            >(id))
+        })
+    }
+
+    fn command_snapshot(&self) -> command_palette::Snapshot {
+        let context = if self.goto_time.open {
+            key_help::Context::Details
+        } else if self.drawing_interaction.captures_pointer() {
+            key_help::Context::Drawings
+        } else {
+            self.help_context()
+        };
+        let mut snapshot = command_palette::Snapshot::new(context);
+        snapshot.active_pane = self.chart.active_pane;
+        snapshot.selected_drawing = self.drawings.selected();
+        snapshot.profiles = self
+            .chart
+            .profiles
+            .iter()
+            .map(|profile| command_palette::ProfileTarget {
+                id: profile.id,
+                label: format!("{} · {}", profile.spec.kind, profile.spec.range),
+                visible: profile.visible,
+                fixed: matches!(profile.spec.range, ProfileRangeSpec::Fixed { .. }),
+            })
+            .collect();
+        for instance in &self.chart.indicators.instances {
+            snapshot.indicators.push(command_palette::IndicatorTarget {
+                id: instance.id,
+                label: format!("{} · {}", instance.spec.label(), instance.source.label()),
+                external_sources: !instance.source.is_chart()
+                    && matches!(
+                        instance.spec,
+                        IndicatorSpec::Cvd { .. } | IndicatorSpec::OpenInterest
+                    ),
+            });
+            if !instance.spec.is_overlay() {
+                if instance.visible {
+                    snapshot.pane_ids.push(instance.id);
+                } else {
+                    snapshot.hidden_pane_ids.push(instance.id);
+                }
+            }
+        }
+        if self.stress.is_none() {
+            snapshot
+                .recent_markets
+                .extend_from_slice(self.selector.recent_markets());
+            snapshot
+                .favorite_markets
+                .extend_from_slice(self.selector.favorite_markets());
+        }
+        snapshot
+    }
+
+    fn continue_goto(&mut self) -> Task<Message> {
+        let Some(target) = self.goto_target else {
+            return Task::none();
+        };
+        if self.history.in_flight {
+            return Task::none();
+        }
+        let Some(oldest) = self.chart.oldest() else {
+            self.goto_target = None;
+            self.goto_page_oldest = None;
+            return self
+                .goto_time
+                .reject("No native candles are available for this market.");
+        };
+        if oldest <= target {
+            self.goto_target = None;
+            self.goto_page_oldest = None;
+            let center = (self.chart.viewport.left + self.chart.viewport.span * 0.5) as i64;
+            let beyond_latest = self.chart.latest().is_some_and(|candle| {
+                center
+                    >= candle
+                        .time
+                        .saturating_add(self.chart.market.interval.seconds())
+            });
+            self.goto_notice = Some(if beyond_latest {
+                "Beyond the latest loaded native candle; no future candles are fabricated.".into()
+            } else {
+                format!(
+                    "Centered on {} UTC · native gaps remain gaps",
+                    chart::utc(center, "%Y-%m-%d %H:%M:%S")
+                )
+            });
+            return Task::none();
+        }
+        if self.chart.next_before.is_none() {
+            self.goto_target = None;
+            self.goto_page_oldest = None;
+            return self.goto_time.reject(format!(
+                "Requested time precedes available native history. Earliest loaded candle: {} UTC.",
+                chart::utc(oldest, "%Y-%m-%d %H:%M:%S"),
+            ));
+        }
+        if self.history.failed.is_some() {
+            self.goto_notice = Some(
+                "UTC jump awaits history retry; existing connection/history errors remain visible."
+                    .into(),
+            );
+            return Task::none();
+        }
+        self.goto_notice = Some(format!(
+            "Loading native history toward {} UTC · Go live cancels the jump",
+            chart::utc(target, "%Y-%m-%d %H:%M:%S"),
+        ));
+        self.goto_page_oldest = Some(oldest);
+        self.older()
+    }
     fn help_context(&self) -> key_help::Context {
-        if self.details.is_some() {
+        if self.goto_time.open || self.details.is_some() {
             key_help::Context::Details
         } else if self.manager.open {
             key_help::Context::Indicators
+        } else if self.profile_controls.open {
+            key_help::Context::Details
         } else if self.selector.open {
             key_help::Context::Market
         } else if self.drawing_controls.is_open() {
@@ -690,6 +1563,147 @@ impl Desktop {
         self.update(Message::HelpAction(action))
     }
     fn update(&mut self, message: Message) -> Task<Message> {
+        let measured = matches!(&message, Message::Key { .. } | Message::StressPulse);
+        let started = self.stress.as_ref().filter(|_| measured).map(|metrics| {
+            metrics.input();
+            Instant::now()
+        });
+        let result = self.handle_message(message);
+        let dirty_from = self.chart.take_candle_dirty_from();
+        self.drawings.sync_vwap_preview(
+            self.chart.candles(),
+            self.chart.market.interval,
+            dirty_from,
+            self.drawing_interaction.vwap_preview_start(),
+        );
+        self.sync_profiles();
+        if let (Some(started), Some(metrics)) = (started, &self.stress) {
+            metrics.update_sample(started.elapsed());
+        }
+        if let Some(history) = self.backfill_vwap_origin() {
+            Task::batch([result, history])
+        } else {
+            result
+        }
+    }
+
+    fn handle_message(&mut self, message: Message) -> Task<Message> {
+        if self.profile_controls.open
+            && matches!(
+                &message,
+                Message::DrawingInput { .. }
+                    | Message::DrawingBlank { .. }
+                    | Message::DrawingCommand { .. }
+                    | Message::DrawingControl(_)
+                    | Message::DrawingMenu
+                    | Message::DrawingProperties(_)
+                    | Message::Manager(_)
+                    | Message::Selector(_)
+                    | Message::SelectInterval(_)
+                    | Message::IndicatorSettings(_)
+                    | Message::IndicatorDetails(_)
+                    | Message::StatusDetails
+            )
+        {
+            return Task::none();
+        }
+        if self.drawing_interaction.is_dragging()
+            && matches!(
+                &message,
+                Message::Action(
+                    Action::Inspect(_)
+                        | Action::InspectPane { .. }
+                        | Action::InspectStep(_)
+                        | Action::ActivatePane(_)
+                        | Action::Pan { .. }
+                        | Action::PanePan { .. }
+                        | Action::Zoom { .. }
+                        | Action::PaneZoom { .. }
+                )
+            )
+        {
+            return Task::none();
+        }
+        if self.drawing_interaction.is_dragging() && matches!(&message, Message::Action(_)) {
+            self.pointer_generation = self.pointer_generation.wrapping_add(1);
+            self.drawing_interaction.suspend_overlay();
+        }
+        if self.workspace.controls.is_open()
+            && !matches!(
+                &message,
+                Message::Workspace(_)
+                    | Message::WorkspacePoll
+                    | Message::WorkspaceSaved { .. }
+                    | Message::WorkspaceResetDone { .. }
+                    | Message::CloseRequested(_)
+                    | Message::PointerCancelled
+                    | Message::MarketData(_)
+                    | Message::ProfileData(_)
+                    | Message::History { .. }
+                    | Message::HistoryFlow { .. }
+                    | Message::OpenInterest(_)
+                    | Message::OpenInterestHistory { .. }
+                    | Message::SourceData(_)
+                    | Message::SourceCatalog { .. }
+                    | Message::Catalog { .. }
+                    | Message::Tick
+                    | Message::Key { .. }
+            )
+        {
+            return Task::none();
+        }
+        if (self.commands.is_some() || self.command_pending)
+            && matches!(
+                &message,
+                Message::Action(_)
+                    | Message::DrawingInput { .. }
+                    | Message::DrawingBlank { .. }
+                    | Message::DrawingCommand { .. }
+                    | Message::DrawingControl(_)
+                    | Message::DrawingMenu
+                    | Message::DrawingProperties(_)
+                    | Message::DrawingCancel
+                    | Message::DrawingClose
+                    | Message::Manager(_)
+                    | Message::Profile(_)
+                    | Message::ProfileEntry(_)
+                    | Message::ProfileEdit(_)
+                    | Message::Selector(_)
+                    | Message::SelectInterval(_)
+                    | Message::IndicatorSettings(_)
+                    | Message::IndicatorDetails(_)
+                    | Message::StatusDetails
+                    | Message::DetailsClose
+                    | Message::EditorClose
+                    | Message::GotoTimeOpen
+                    | Message::GotoTime(_)
+                    | Message::QuickMarket(_)
+                    | Message::RetryContributor { .. }
+                    | Message::RetrySourceDiscovery { .. }
+                    | Message::UseChartSource(_)
+                    | Message::RetryIndicatorSources(_)
+            )
+        {
+            return Task::none();
+        }
+        if self.goto_time.open
+            && matches!(
+                &message,
+                Message::SelectInterval(_)
+                    | Message::IndicatorSettings(_)
+                    | Message::IndicatorDetails(_)
+                    | Message::StatusDetails
+                    | Message::DrawingControl(_)
+                    | Message::DrawingMenu
+                    | Message::DrawingProperties(_)
+                    | Message::Manager(_)
+                    | Message::Selector(_)
+                    | Message::UseChartSource(_)
+                    | Message::RetryIndicatorSources(_)
+            )
+        {
+            return Task::none();
+        }
         if self.drawing_controls.is_open()
             && matches!(
                 &message,
@@ -704,10 +1718,169 @@ impl Desktop {
             return Task::none();
         }
         match message {
+            Message::PointerCancelled => {
+                // Canvas does not receive window lifecycle events. Reset every
+                // pane's held input state at this explicit cancellation boundary.
+                self.pointer_generation = self.pointer_generation.wrapping_add(1);
+                self.drawing_interaction.suspend_overlay();
+                self.profile_range = None;
+                self.chart.dispatch(Action::Inspect(None));
+            }
+            Message::Profile(event) => return self.profile_event(event),
+            Message::ProfileEntry(entry) => return self.profile_entry(entry),
+            Message::ProfileEdit(edit) => return self.edit_profile(edit),
+            Message::ProfileData(event) => {
+                self.profiles.accept(event);
+                self.profile_statuses();
+            }
+            Message::Workspace(event) => return self.workspace_event(event),
+            Message::WorkspacePoll => return self.poll_workspace_save(false),
+            Message::WorkspaceSaved { revision, result } => {
+                return self.workspace_saved(revision, result);
+            }
+            Message::WorkspaceResetDone {
+                revision,
+                kind,
+                snapshot,
+                result,
+            } => {
+                return self.workspace_reset_done(revision, kind, snapshot, result);
+            }
+            Message::CloseRequested(id) => {
+                self.workspace.closing = Some(id);
+                return self.poll_workspace_save(true);
+            }
+            Message::CommandOpen => {
+                self.profile_range = None;
+                if self.commands.is_some() || self.command_pending {
+                    return self.close_commands();
+                }
+                self.command_pending = true;
+                return iced::advanced::widget::operate(FindFocused(None))
+                    .map(Message::CommandFocused);
+            }
+            Message::CommandFocused(focus) => {
+                if !self.command_pending {
+                    return Task::none();
+                }
+                self.command_pending = false;
+                self.command_focus = focus;
+                self.help_open = false;
+                self.drawing_interaction.suspend_overlay();
+                self.commands = Some(command_palette::Commands::show(self.command_snapshot()));
+                return self.commands.as_ref().unwrap().focus();
+            }
+            Message::CommandPalette(event) => {
+                if matches!(event, command_palette::Event::Escape) {
+                    return self.close_commands();
+                }
+                let Some(commands) = &mut self.commands else {
+                    return Task::none();
+                };
+                if let Some(message) = commands.update(event) {
+                    let focus = self.close_commands();
+                    return Task::batch([focus, self.update(message)]);
+                }
+                return self.commands.as_ref().unwrap().follow_selection();
+            }
+            Message::GotoTimeOpen => {
+                if self.drawing_blocked() {
+                    return Task::none();
+                }
+                self.goto_target = None;
+                self.goto_page_oldest = None;
+                self.goto_notice = None;
+                self.drawing_interaction.cancel();
+                return self.goto_time.show(self.chart.inspection.map_or_else(
+                    || (self.chart.viewport.left + self.chart.viewport.span * 0.5) as i64,
+                    |(time, _)| time,
+                ));
+            }
+            Message::GotoTime(event) => {
+                if self.help_open {
+                    return Task::none();
+                }
+                match self.goto_time.update(event) {
+                    Some(goto_time::Effect::Jump(time)) => {
+                        self.chart.dispatch(Action::GotoTime(time));
+                        self.workspace.mark_dirty();
+                        self.clear_geometry();
+                        self.goto_target = Some(time);
+                        self.goto_page_oldest = None;
+                        return self.continue_goto();
+                    }
+                    Some(goto_time::Effect::Close) => {}
+                    None => {}
+                }
+                return Task::none();
+            }
+            Message::QuickMarket(market) => {
+                if self.help_open
+                    || self.manager.open
+                    || self.details.is_some()
+                    || self.goto_time.open
+                    || self.drawing_controls.is_open()
+                {
+                    return Task::none();
+                }
+                if self.stress.is_some() {
+                    return Task::none();
+                }
+                self.drawing_interaction.cancel();
+                let focus = self.selector.show_exact(&market);
+                return Task::batch([focus, self.load_catalog(market.exchange, market.product)]);
+            }
+            Message::RetryContributor { id, market } => {
+                if !self.help_open
+                    && !self.manager.open
+                    && !self.selector.open
+                    && !self.goto_time.open
+                {
+                    return self.retry_indicator_contributor(id, &market);
+                }
+            }
+            Message::RetrySourceDiscovery {
+                id,
+                exchange,
+                product,
+            } => {
+                if !self.help_open
+                    && !self.manager.open
+                    && !self.selector.open
+                    && !self.goto_time.open
+                {
+                    return self.retry_indicator_source_discovery(id, exchange, product);
+                }
+            }
+            Message::StressPulse => {
+                if !self.drawing_blocked()
+                    && let Some(metrics) = &self.stress
+                {
+                    self.chart.dispatch(Action::Pan {
+                        time: metrics.pan(),
+                        price: 0.0,
+                    });
+                    self.clear_geometry();
+                }
+                return Task::none();
+            }
+            Message::StressFrame(at) => {
+                if let Some(metrics) = &self.stress {
+                    metrics.frame(at);
+                }
+                return Task::none();
+            }
+            Message::StressFinish => {
+                if let Some(metrics) = &self.stress {
+                    metrics.report();
+                    return iced::exit();
+                }
+            }
             Message::DrawingCancel => {
                 if !self.drawing_blocked() {
                     self.drawing_interaction.cancel();
                     self.drawings.select(None);
+                    self.selected_profile = None;
                 }
             }
             Message::DrawingMenu => {
@@ -739,6 +1912,9 @@ impl Desktop {
             }
             Message::DrawingClose => {
                 if !self.help_open {
+                    if self.drawing_controls.is_new_text() {
+                        self.drawing_interaction.finish_text(false);
+                    }
                     self.drawing_controls.close();
                 }
             }
@@ -749,11 +1925,16 @@ impl Desktop {
                 if self.drawing_blocked() || generation != self.drawings.generation() {
                     return Task::none();
                 }
-                self.drawing_interaction.cancel();
+                if matches!(&command, DrawingCommand::Style { .. }) {
+                    self.drawing_interaction.suspend_overlay();
+                } else {
+                    self.drawing_interaction.cancel();
+                }
                 self.commit_drawing(command);
             }
             Message::DrawingBlank { generation } => {
                 if !self.drawing_blocked() && generation == self.drawing_interaction.generation() {
+                    self.drawing_interaction.suspend_overlay();
                     self.drawings.select(None);
                     self.chart.dispatch(Action::ActivatePane(None));
                 }
@@ -781,17 +1962,30 @@ impl Desktop {
                     self.chart.dispatch(Action::ActivatePane(None));
                     self.drawing_error = None;
                 }
-                let effect = self.drawing_interaction.update(event, &self.drawings);
+                if matches!(&event, drawing_interaction::Input::Down { .. }) {
+                    self.chart.dispatch(Action::Inspect(None));
+                }
+                if matches!(&event, drawing_interaction::Input::Leave) {
+                    self.chart.dispatch(Action::Inspect(None));
+                }
+                let effect = self.drawing_interaction.update_native(
+                    event,
+                    &self.drawings,
+                    self.chart.candles(),
+                );
                 match effect {
                     drawing_interaction::Effect::None => {}
                     drawing_interaction::Effect::Select(id) => {
+                        if id.is_some() {
+                            self.selected_profile = None;
+                        }
                         self.drawings.select(id);
                     }
                     drawing_interaction::Effect::Commit(command) => {
                         self.commit_drawing(command);
                     }
                     drawing_interaction::Effect::Text(anchor) => {
-                        self.drawing_interaction.cancel();
+                        self.drawing_interaction.suspend_for_text();
                         self.drawing_controls.open_text(&self.drawings, anchor);
                         return Task::batch([
                             self.drawing_focus(),
@@ -810,19 +2004,44 @@ impl Desktop {
                 }
             }
             Message::DrawingControl(event) => {
+                let quick_style = matches!(
+                    &event,
+                    drawing_controls::Event::QuickInk(_)
+                        | drawing_controls::Event::QuickPattern(_)
+                        | drawing_controls::Event::QuickWidth(_)
+                );
                 if self.help_open
                     || self.manager.open
                     || self.selector.open
                     || self.details.is_some()
-                    || !self.drawing_controls.is_open()
-                    || self.drawing_controls.context_generation() != self.drawings.generation()
+                    || self.goto_time.open
                 {
                     return Task::none();
                 }
+                if !self.drawing_controls.is_open()
+                    && !quick_style
+                    && !matches!(&event, drawing_controls::Event::Repeat(_))
+                {
+                    self.drawing_controls.open_menu(&self.drawings);
+                }
+                if self.drawing_controls.is_open()
+                    && self.drawing_controls.context_generation() != self.drawings.generation()
+                {
+                    return Task::none();
+                }
+                let new_text = self.drawing_controls.is_new_text();
+                let cancel_text = new_text
+                    && matches!(
+                        &event,
+                        drawing_controls::Event::Cancel | drawing_controls::Event::Close
+                    );
                 let editing = self.drawing_controls.is_editing();
                 let effect = self.drawing_controls.update(event, &self.drawings);
                 match effect {
                     drawing_controls::Effect::None => {}
+                    drawing_controls::Effect::SelectedVolumeProfile => {
+                        return self.profile_entry(indicator_manager::ProfileEntry::SelectedVolume);
+                    }
                     drawing_controls::Effect::ChooseTool(tool) => {
                         if tool != DrawingTool::Select && self.chart.latest().is_none() {
                             self.drawing_controls
@@ -831,13 +2050,18 @@ impl Desktop {
                         }
                         self.drawing_controls.close();
                         self.drawing_interaction.choose_tool(tool);
+                        self.selected_profile = None;
                         if tool != DrawingTool::Select {
                             self.drawings.select(None);
+                        }
+                        if self.chart.maximized() && !self.chart.pane_should_render(None) {
+                            self.chart.dispatch(Action::TogglePaneMaximized(None));
                         }
                         self.chart.dispatch(Action::ActivatePane(None));
                         self.drawing_error = None;
                     }
                     drawing_controls::Effect::Select(id) => {
+                        self.selected_profile = None;
                         self.drawings.select(id);
                         self.chart.dispatch(Action::ActivatePane(None));
                         if !editing && self.drawing_controls.is_editing() {
@@ -851,19 +2075,37 @@ impl Desktop {
                         }
                     }
                     drawing_controls::Effect::Magnet(enabled) => {
-                        self.drawing_interaction.set_magnet(enabled)
+                        self.drawing_interaction.set_magnet(enabled);
+                        self.workspace.mark_dirty();
                     }
                     drawing_controls::Effect::ToggleMagnet => {
                         self.drawing_interaction
                             .set_magnet(!self.drawing_interaction.magnet());
+                        self.workspace.mark_dirty();
+                    }
+                    drawing_controls::Effect::Repeat(repeat) => {
+                        self.drawing_interaction.set_repeat(repeat);
                     }
                     drawing_controls::Effect::Commit(command) => {
-                        self.drawing_interaction.cancel();
-                        if self.commit_drawing(command) && editing {
-                            self.drawing_controls.close();
+                        if quick_style {
+                            self.drawing_interaction.suspend_overlay();
+                        } else if !new_text {
+                            self.drawing_interaction.cancel();
+                        }
+                        if self.commit_drawing(command) {
+                            if new_text {
+                                self.drawing_interaction.finish_text(true);
+                            }
+                            if editing {
+                                self.drawing_controls.close();
+                            }
                         }
                     }
                     drawing_controls::Effect::Close => self.drawing_controls.close(),
+                }
+                if cancel_text {
+                    self.drawing_interaction.finish_text(false);
+                    self.drawing_controls.close();
                 }
                 if editing && self.drawing_controls.is_open() && !self.drawing_controls.is_editing()
                 {
@@ -879,6 +2121,42 @@ impl Desktop {
                 captured,
             } => {
                 use keyboard::{Key, key::Named};
+                if self.workspace.controls.is_open() {
+                    if let Some(event) = self.workspace.controls.key(
+                        key.as_ref(),
+                        modifiers,
+                        self.workspace.reset_pending,
+                    ) {
+                        return self.workspace_event(event);
+                    }
+                    return Task::none();
+                }
+                if modifiers.control()
+                    && !modifiers.alt()
+                    && matches!(key.as_ref(), Key::Character("k" | "K"))
+                {
+                    return self.update(Message::CommandOpen);
+                }
+                if self.commands.is_some() {
+                    if matches!(key.as_ref(), Key::Named(Named::Escape)) {
+                        return self.close_commands();
+                    }
+                    if matches!(key.as_ref(), Key::Named(Named::F1)) {
+                        let focus = self.close_commands();
+                        self.help_open = true;
+                        self.help_selection = 0;
+                        return focus;
+                    }
+                    let (_, message) = self.commands.as_mut().unwrap().key(key, modifiers);
+                    if let Some(message) = message {
+                        let focus = self.close_commands();
+                        return Task::batch([focus, self.update(message)]);
+                    }
+                    return self.commands.as_ref().unwrap().follow_selection();
+                }
+                if self.command_pending {
+                    return Task::none();
+                }
                 if matches!(key.as_ref(), Key::Named(Named::F1))
                     || (!self.selector.open
                         && !self.manager.open
@@ -887,10 +2165,45 @@ impl Desktop {
                 {
                     if !self.help_open {
                         self.drawing_interaction.cancel();
+                        self.profile_range = None;
                         self.help_open = true;
                         self.help_selection = 0;
                     }
                     return Task::none();
+                }
+                if self.goto_time.open && !self.help_open {
+                    if matches!(key.as_ref(), Key::Named(Named::Tab)) {
+                        return if modifiers.shift() {
+                            iced::widget::focus_previous()
+                        } else {
+                            iced::widget::focus_next()
+                        };
+                    }
+                    if (matches!(key.as_ref(), Key::Named(Named::Escape)) || !captured)
+                        && let Some(event) = self.goto_time.key(key.as_ref(), modifiers)
+                    {
+                        return self.update(Message::GotoTime(event));
+                    }
+                    return Task::none();
+                }
+                if modifiers.control()
+                    && modifiers.shift()
+                    && !modifiers.alt()
+                    && matches!(key.as_ref(), Key::Character("r" | "R"))
+                    && !self.help_open
+                    && !self.selector.open
+                    && !self.manager.open
+                    && !self.profile_controls.open
+                    && self.details.is_none()
+                    && !self.drawing_controls.is_editing()
+                    && (self.drawing_controls.is_open()
+                        || (self.chart.active_pane.is_none()
+                            && (self.drawing_interaction.tool() != DrawingTool::Select
+                                || self.drawings.selected().is_some())))
+                {
+                    return self.update(Message::DrawingControl(drawing_controls::Event::Repeat(
+                        !self.drawing_interaction.repeat(),
+                    )));
                 }
                 if self.help_open {
                     if matches!(key.as_ref(), Key::Named(Named::Escape)) {
@@ -997,6 +2310,55 @@ impl Desktop {
                     if !captured && matches!(key.as_ref(), Key::Named(Named::Enter)) {
                         return self.update(Message::Selector(market_selector::Event::Submit));
                     }
+                } else if self.profile_controls.open {
+                    // Focused inputs/buttons own Enter; do not submit a second
+                    // time through the global keyboard listener.
+                    if captured && matches!(key.as_ref(), Key::Named(Named::Enter)) {
+                        return Task::none();
+                    }
+                    if let Some(event) =
+                        self.profile_controls
+                            .key(key.as_ref(), modifiers, &self.chart.profiles)
+                    {
+                        return self.update(Message::Profile(event));
+                    }
+                    return Task::none();
+                } else if let Some(placement) = &mut self.profile_range {
+                    match key.as_ref() {
+                        Key::Named(Named::Escape) => {
+                            return self
+                                .update(Message::Profile(profile_controls::Event::RangeCancel));
+                        }
+                        Key::Named(Named::Enter) => {
+                            let time = placement.cursor_ms;
+                            return self.update(Message::Profile(
+                                profile_controls::Event::RangePoint(time),
+                            ));
+                        }
+                        Key::Named(Named::ArrowLeft | Named::ArrowRight) => {
+                            let sign = if matches!(key.as_ref(), Key::Named(Named::ArrowLeft)) {
+                                -1
+                            } else {
+                                1
+                            };
+                            let step = self
+                                .chart
+                                .market
+                                .interval
+                                .seconds()
+                                .saturating_mul(1000)
+                                .saturating_mul(if modifiers.shift() { 10 } else { 1 });
+                            placement.cursor_ms = placement
+                                .cursor_ms
+                                .saturating_add(step.saturating_mul(sign));
+                            let time = placement.cursor_ms;
+                            let price = self.chart.latest().map_or(0.0, |bar| bar.close);
+                            self.chart
+                                .dispatch(Action::Inspect(Some((time as f64 / 1000.0, price))));
+                        }
+                        _ => {}
+                    }
+                    return Task::none();
                 } else if self.manager.open {
                     if modifiers.control() && matches!(key.as_ref(), Key::Character("j" | "J")) {
                         if let Some(id) = self.manager.selected() {
@@ -1010,11 +2372,21 @@ impl Desktop {
                         return self.update(Message::Action(Action::ManageIndicators));
                     }
                     if matches!(key.as_ref(), Key::Named(Named::Tab)) {
-                        return if modifiers.shift() {
+                        let task = if modifiers.shift() {
                             iced::widget::focus_previous()
                         } else {
                             iced::widget::focus_next()
                         };
+                        return task.chain(self.manager.reveal_focus());
+                    }
+                    if matches!(key.as_ref(), Key::Named(Named::PageUp | Named::PageDown)) {
+                        return self.manager.scroll_parameters(
+                            if matches!(key.as_ref(), Key::Named(Named::PageUp)) {
+                                -300.0
+                            } else {
+                                300.0
+                            },
+                        );
                     }
                     if let Some(event) =
                         self.manager
@@ -1023,6 +2395,9 @@ impl Desktop {
                         return self.update(Message::Manager(event));
                     }
                 } else if self.drawing_controls.is_open() {
+                    if matches!(key.as_ref(), Key::Named(Named::Escape)) {
+                        self.drawing_interaction.cancel();
+                    }
                     if matches!(key.as_ref(), Key::Named(Named::Tab)) {
                         return if modifiers.shift() {
                             iced::widget::focus_previous()
@@ -1048,6 +2423,66 @@ impl Desktop {
                         return self.update(Message::DrawingControl(event));
                     }
                 } else if !captured {
+                    if let Some(id) = self.selected_profile
+                        && self.chart.active_pane.is_none()
+                        && self.drawings.selected().is_none()
+                        && self.drawing_interaction.tool() == DrawingTool::Select
+                    {
+                        if matches!(key.as_ref(), Key::Named(Named::Escape)) {
+                            self.selected_profile = None;
+                            return Task::none();
+                        }
+                        if modifiers.control()
+                            && !modifiers.alt()
+                            && matches!(key.as_ref(), Key::Character("e" | "E"))
+                        {
+                            return self.profile_event(profile_controls::Event::Open(Some(id)));
+                        }
+                        if matches!(key.as_ref(), Key::Named(Named::Delete)) {
+                            self.selected_profile = None;
+                            return self.profile_event(profile_controls::Event::Remove(id));
+                        }
+                        if modifiers.control()
+                            && !modifiers.alt()
+                            && matches!(key.as_ref(), Key::Character("h" | "H"))
+                        {
+                            return self.profile_event(profile_controls::Event::ToggleVisible(id));
+                        }
+                    }
+                    if modifiers.control()
+                        && !modifiers.alt()
+                        && matches!(key.as_ref(), Key::Character("g" | "G"))
+                    {
+                        return self.update(Message::GotoTimeOpen);
+                    }
+                    if modifiers.control() && modifiers.alt() {
+                        if modifiers.shift()
+                            && matches!(key.as_ref(), Key::Named(Named::ArrowUp | Named::ArrowDown))
+                        {
+                            return self.chart.active_pane.map_or_else(Task::none, |id| {
+                                self.update(Message::Action(Action::MovePane {
+                                    id,
+                                    direction: if matches!(key.as_ref(), Key::Named(Named::ArrowUp))
+                                    {
+                                        -1
+                                    } else {
+                                        1
+                                    },
+                                }))
+                            });
+                        }
+                        if matches!(key.as_ref(), Key::Character("m" | "M")) {
+                            return self.update(Message::Action(Action::TogglePaneMaximized(
+                                self.chart.active_pane,
+                            )));
+                        }
+                        if let Some(event) =
+                            self.drawing_controls
+                                .key(key.as_ref(), modifiers, &self.drawings)
+                        {
+                            return self.update(Message::DrawingControl(event));
+                        }
+                    }
                     if modifiers.control()
                         && modifiers.shift()
                         && matches!(key.as_ref(), Key::Character("d" | "D"))
@@ -1146,6 +2581,7 @@ impl Desktop {
             }
             Message::HelpOpen => {
                 self.drawing_interaction.cancel();
+                self.profile_range = None;
                 self.help_open = true;
                 self.help_selection = 0;
             }
@@ -1257,66 +2693,18 @@ impl Desktop {
                 }));
             }
             Message::RetryIndicatorSources(id) => {
-                if self.help_open || self.manager.open || self.selector.open {
+                if self.help_open || self.manager.open || self.selector.open || self.goto_time.open
+                {
                     return Task::none();
                 }
-                let Some(instance) = self
-                    .chart
-                    .indicators
-                    .instances
-                    .iter()
-                    .find(|item| item.id == id)
-                else {
-                    return Task::none();
-                };
-                let kind = match instance.spec {
-                    IndicatorSpec::Cvd { .. } if !instance.source.is_chart() => {
-                        source_feeds::Kind::Cvd
-                    }
-                    IndicatorSpec::OpenInterest if !instance.source.is_chart() => {
-                        source_feeds::Kind::OpenInterest
-                    }
-                    _ => return Task::none(),
-                };
-                for market in &instance.source.markets {
-                    // Stored source intervals are rebound to the active native context.
-                    let key = self
-                        .source_requests
-                        .iter_mut()
-                        .find(|((wanted, wanted_kind), _)| {
-                            *wanted_kind == kind
-                                && wanted.exchange == market.exchange
-                                && wanted.product == market.product
-                                && wanted.symbol == market.symbol
-                        });
-                    if let Some(((market, _), request)) = key {
-                        self.next_source_generation = self.next_source_generation.wrapping_add(1);
-                        request.generation = self.next_source_generation;
-                        if let Some(input) = self.source_inputs.get_mut(market) {
-                            match kind {
-                                source_feeds::Kind::Cvd => {
-                                    input.flow_connected = false;
-                                    input.revoke_unfinished(source_controller::now_ms());
-                                }
-                                source_feeds::Kind::OpenInterest => input.oi_connected = false,
-                            }
-                            input.revision = input.revision.wrapping_add(1);
-                        }
-                    }
-                }
-                self.refresh_source_panes();
-                let focus = self.update(Message::IndicatorSettings(id));
-                return Task::batch([
-                    focus,
-                    self.update(Message::Manager(indicator_manager::Event::SourceRetry)),
-                ]);
+                return self.retry_indicator_sources(id);
             }
             Message::Manager(event) => {
-                if matches!(&event, indicator_manager::Event::SourceRetry) {
-                    self.retry_source_discovery();
-                    self.revalidate_all_sources();
-                    self.refresh_source_panes();
-                }
+                let discovery = if matches!(&event, indicator_manager::Event::SourceRetry) {
+                    self.retry_source_discovery_task()
+                } else {
+                    Task::none()
+                };
                 if matches!(
                     &event,
                     indicator_manager::Event::Kind(_)
@@ -1329,19 +2717,26 @@ impl Desktop {
                 }
                 let (action, focus) = self.manager.update(event, &self.chart);
                 if let Some(action) = action {
-                    return Task::batch([self.update(Message::Action(action)), focus]);
+                    return Task::batch([self.update(Message::Action(action)), focus, discovery]);
                 }
-                return Task::batch([focus, self.ensure_source_catalogs()]);
+                return Task::batch([focus, discovery, self.ensure_source_catalogs()]);
             }
             Message::Selector(event) => {
+                if let market_selector::Event::Quick(market) = event {
+                    return self.update(Message::QuickMarket(market));
+                }
                 if matches!(&event, market_selector::Event::Retry) {
                     let (exchange, product) = self.selector.scope();
-                    return self.load_catalog(exchange, product);
+                    return self.retry_catalog(exchange, product);
                 }
                 let prior_scope = self.selector.scope();
+                let favorite = matches!(&event, market_selector::Event::ToggleFavorite);
                 let submitting = matches!(&event, market_selector::Event::Submit);
                 if let Some(action) = self.selector.update(event) {
                     return self.update(Message::Action(action));
+                }
+                if favorite {
+                    self.workspace.mark_dirty();
                 }
                 let scope = self.selector.scope();
                 if scope != prior_scope {
@@ -1408,6 +2803,14 @@ impl Desktop {
                     self.chart.base_asset = instrument.base_coin.clone();
                     self.clear_geometry();
                 }
+                if self.workspace.waiting_market {
+                    return self.complete_workspace_market_validation();
+                }
+                if let Some(market) = self.selector.take_ready_quick()
+                    && let Some(catalog) = self.selector.catalog().cloned()
+                {
+                    return self.switch_market(market, catalog);
+                }
                 self.sync_indicator_sources();
                 return Task::batch([
                     if self.selector.open {
@@ -1444,8 +2847,10 @@ impl Desktop {
                 // Widget input is blocked behind dialogs; also reject queued canvas actions.
                 if (self.manager.open
                     || self.selector.open
+                    || self.profile_controls.open
                     || self.details.is_some()
-                    || self.drawing_controls.is_open())
+                    || self.drawing_controls.is_open()
+                    || self.goto_time.open)
                     && !matches!(&action, Action::ManageIndicators | Action::ManageMarket)
                     && !(self.selector.open && matches!(&action, Action::SelectMarket(_)))
                     && !(self.manager.open
@@ -1460,6 +2865,29 @@ impl Desktop {
                 {
                     return Task::none();
                 }
+                let leaves_goto = match &action {
+                    Action::Reset | Action::Live | Action::SelectMarket(_) => true,
+                    Action::Pan { time, .. } | Action::PanePan { time, .. } => *time != 0.0,
+                    Action::Zoom { time, .. } | Action::PaneZoom { time, .. } => *time != 1.0,
+                    Action::InspectStep(_) => true,
+                    _ => false,
+                };
+                if leaves_goto {
+                    self.goto_target = None;
+                    self.goto_page_oldest = None;
+                    self.goto_notice = None;
+                }
+                if matches!(&action, Action::ManageIndicators | Action::ManageMarket) {
+                    self.goto_time.open = false;
+                    self.profile_controls.open = false;
+                    self.profile_range = None;
+                }
+                if let Action::ActivatePane(id) = &action
+                    && self.chart.maximized()
+                    && !self.chart.pane_should_render(*id)
+                {
+                    self.chart.dispatch(Action::TogglePaneMaximized(*id));
+                }
                 if matches!(&action, Action::ManageIndicators | Action::ManageMarket) {
                     self.drawing_interaction.cancel();
                     self.drawing_controls.close();
@@ -1467,6 +2895,14 @@ impl Desktop {
                     self.drawing_interaction.cancel();
                 }
                 match action {
+                    Action::TogglePaneMaximized(target) => {
+                        self.chart.dispatch(Action::TogglePaneMaximized(target));
+                        if let Some(target) = self.chart.maximized_target() {
+                            self.chart.dispatch(Action::ActivatePane(target));
+                        }
+                        self.clear_geometry();
+                        return Task::none();
+                    }
                     Action::ManageIndicators => {
                         self.details = None;
                         if self.manager.open {
@@ -1525,6 +2961,12 @@ impl Desktop {
                         );
                     }
                     Action::Retry => {
+                        if self.workspace.waiting_market {
+                            return self.retry_catalog(
+                                self.chart.market.exchange,
+                                self.chart.market.product,
+                            );
+                        }
                         self.theme_file.reload();
                         self.clear_geometry();
                         // One generation invalidates old native subscriptions and history tasks.
@@ -1554,6 +2996,25 @@ impl Desktop {
                     }
                     Action::Older => return self.older(),
                     _ => {
+                        if matches!(
+                            &action,
+                            Action::AdjustPaneHeight { .. }
+                                | Action::ResetPaneHeight(_)
+                                | Action::MovePane { .. }
+                                | Action::TogglePaneCollapsed(_)
+                                | Action::TogglePaneMaximized(_)
+                                | Action::ToggleIndicator(_)
+                                | Action::AddIndicator(_)
+                                | Action::RemoveIndicator(_)
+                                | Action::ConfigureIndicator { .. }
+                                | Action::ApplyIndicator { .. }
+                                | Action::Reset
+                        ) {
+                            // Non-pointer layout commands end an owned resize.
+                            // SetPaneHeight is intentionally exempt: its replies
+                            // are the resize itself, not a new input context.
+                            self.pointer_generation = self.pointer_generation.wrapping_add(1);
+                        }
                         let changes_instances = matches!(
                             &action,
                             Action::AddIndicator(_)
@@ -1582,7 +3043,13 @@ impl Desktop {
                             }
                             _ => Task::none(),
                         };
-                        if self.chart.dispatch(action) {
+                        let durable = workspace_runtime::durable_action(&action);
+                        let geometry_changed = self.chart.dispatch(action);
+                        if durable && (!applies_parameters || self.chart.indicator_error.is_none())
+                        {
+                            self.workspace.mark_dirty();
+                        }
+                        if geometry_changed {
                             if let Some(id) = pane_only {
                                 if let Some(cache) = self.pane_caches.get(&id) {
                                     cache.clear();
@@ -1900,7 +3367,32 @@ impl Desktop {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        let pointer_lifecycle = iced::event::listen_with(|event, _, _| match event {
+            iced::Event::Window(
+                iced::window::Event::Unfocused | iced::window::Event::Resized(_),
+            ) => Some(Message::PointerCancelled),
+            _ => None,
+        });
+        if self.stress.is_some() {
+            return Subscription::batch([
+                pointer_lifecycle,
+                iced::time::every(Duration::from_millis(200)).map(|_| Message::StressPulse),
+                iced::window::frames().map(Message::StressFrame),
+            ]);
+        }
+        if self.workspace.waiting_market {
+            return Subscription::batch([
+                pointer_lifecycle,
+                Self::workspace_keyboard_subscription(),
+                iced::window::close_requests().map(Message::CloseRequested),
+                iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick),
+                self.workspace_save_subscription(),
+            ]);
+        }
         Subscription::batch([
+            pointer_lifecycle,
+            iced::window::close_requests().map(Message::CloseRequested),
+            self.workspace_save_subscription(),
             Subscription::run_with_id(
                 (
                     self.market_generation,
@@ -1941,21 +3433,11 @@ impl Desktop {
                 Subscription::none()
             },
             self.source_subscription(),
+            self.profiles
+                .subscription(&self.data)
+                .map(Message::ProfileData),
             iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick),
-            iced::event::listen_with(|event, status, _| {
-                if let iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                    key, modifiers, ..
-                }) = event
-                {
-                    Some(Message::Key {
-                        key,
-                        modifiers,
-                        captured: status == iced::event::Status::Captured,
-                    })
-                } else {
-                    None
-                }
-            }),
+            Self::workspace_keyboard_subscription(),
         ])
     }
 
@@ -1964,6 +3446,9 @@ impl Desktop {
     }
 
     fn title(&self) -> String {
+        if let Some(metrics) = &self.stress {
+            return metrics.label();
+        }
         format!(
             "{} · {} · {} · {} · {}",
             self.chart.market.exchange,
@@ -1972,57 +3457,6 @@ impl Desktop {
             self.chart.market.interval,
             self.native_quote
         )
-    }
-
-    fn source_problem(&self, instance: &mexc_indicators::IndicatorInstance) -> Option<String> {
-        if instance.source.is_chart() {
-            return None;
-        }
-        if let Some(error) = instance.all_source_error() {
-            return Some(error.to_owned());
-        }
-        for market in &instance.source.markets {
-            let name = || format!("{} {}", market.exchange, market.symbol);
-            if market.product != self.chart.market.product {
-                return Some(format!(
-                    "{} is {}; chart is {}. Choose a matching source or use Chart.",
-                    name(),
-                    market.product,
-                    self.chart.market.product
-                ));
-            }
-            let Some(Ok(catalog)) = self.source_catalogs.get(&(market.exchange, market.product))
-            else {
-                continue;
-            };
-            let Some(native) = catalog
-                .instruments
-                .iter()
-                .find(|item| item.symbol == market.symbol)
-            else {
-                return Some(format!(
-                    "{} is no longer listed. Choose an available native source or use Chart.",
-                    name()
-                ));
-            };
-            if native.base_coin != self.chart.base_asset {
-                return Some(format!(
-                    "{} supplies {}; chart is {}. Choose a matching source or use Chart.",
-                    name(),
-                    native.base_coin,
-                    self.chart.base_asset
-                ));
-            }
-            if matches!(instance.spec, IndicatorSpec::Cvd { .. })
-                && !catalog.intervals.contains(&self.chart.market.interval)
-            {
-                return Some(format!(
-                    "{} has no native {} CVD interval. Choose a compatible source or use Chart; bars are not resampled.",
-                    market.exchange, self.chart.market.interval
-                ));
-            }
-        }
-        None
     }
 
     fn status_details_view(&self) -> Element<'_, Message> {
@@ -2159,6 +3593,14 @@ impl Desktop {
             ))
             .size(13),
         );
+        details = details.push(text("Workspace").size(17));
+        details = details.push(text(self.workspace.description()).size(13));
+        if self.workspace.error.is_some() {
+            details = details.push(
+                button("Retry workspace save")
+                    .on_press(Message::Workspace(workspace_controls::Event::RetrySave)),
+            );
+        }
         details.into()
     }
 
@@ -2182,7 +3624,7 @@ impl Desktop {
                         instance,
                         self.theme_file.palette,
                         &self.native_volume_unit,
-                        self.source_problem(instance),
+                        self.indicator_source_health(instance),
                     ),
                 )
             }
@@ -2191,27 +3633,50 @@ impl Desktop {
         match details {
             Details::Status => {
                 footer = footer.push(
-                    button("Retry connection/history/theme")
+                    button(text("Retry connection").size(12))
+                        .style(ui::quiet)
+                        .padding([6, 10])
                         .on_press(Message::HelpAction(Action::Retry)),
                 );
             }
             Details::Indicator(id) => {
-                footer = footer.push(button("Settings").on_press(Message::IndicatorSettings(id)));
+                footer = footer.push(
+                    button(text("Settings").size(12))
+                        .style(ui::quiet)
+                        .padding([6, 10])
+                        .on_press(Message::IndicatorSettings(id)),
+                );
             }
         }
-        footer = footer.push(button("Close").on_press(Message::DetailsClose));
+        footer = footer
+            .push(iced::widget::Space::new(Length::Fill, Length::Shrink))
+            .push(
+                button(text("Close").size(12))
+                    .style(ui::quiet)
+                    .padding([6, 10])
+                    .on_press(Message::DetailsClose),
+            )
+            .push(ui::key("Esc"));
         column![
             row![
                 text(title).size(20),
                 iced::widget::Space::new(Length::Fill, Length::Shrink),
-                button("Keys [F1]").on_press(Message::HelpOpen)
+                button(ui::key("F1"))
+                    .style(ui::quiet)
+                    .padding(2)
+                    .on_press(Message::HelpOpen)
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
-            scrollable(body)
-                .id(scrollable::Id::new("details-body"))
-                .height(Length::Fill),
-            footer.wrap(),
+            ui::separator(),
+            scrollable(container(body).padding(iced::Padding {
+                right: 16.0,
+                ..iced::Padding::default()
+            }))
+            .id(scrollable::Id::new("details-body"))
+            .height(Length::Fill),
+            ui::separator(),
+            footer,
         ]
         .spacing(12)
         .width(Length::Fill)
@@ -2220,30 +3685,35 @@ impl Desktop {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let started = self.stress.as_ref().map(|_| Instant::now());
+        let view = self.view_content();
+        if let (Some(started), Some(metrics)) = (started, &self.stress) {
+            metrics.view_sample(started.elapsed());
+        }
+        view
+    }
+
+    fn view_content(&self) -> Element<'_, Message> {
         let blocked = self.drawing_blocked();
         let candle = self.chart.inspected().or_else(|| self.chart.latest());
-        let ohlc = candle
-            .map(|c| {
-                format!(
-                    "{} UTC  O {}  H {}  L {}  C {}  Vol {} {}",
-                    chart::utc(c.time, "%Y-%m-%d %H:%M"),
-                    self.chart.format_price(c.open),
-                    self.chart.format_price(c.high),
-                    self.chart.format_price(c.low),
-                    self.chart.format_price(c.close),
-                    presentation::quantity(c.volume),
-                    self.native_volume_unit
-                )
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "Waiting for {} · {} candles…",
-                    self.chart.market.symbol, self.chart.market.interval
-                )
-            });
         let readout: Element<'_, Message> = if let Some(candle) = candle {
-            tooltip(
-                text(ohlc).size(13),
+            let value = |label: &'static str, value: String| {
+                row![
+                    text(label).size(10).style(ui::muted_text),
+                    text(value).size(12).font(iced::Font::MONOSPACE),
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center)
+            };
+            let volume = tooltip(
+                value(
+                    "VOL",
+                    format!(
+                        "{} {}",
+                        presentation::quantity(candle.volume),
+                        self.native_volume_unit
+                    ),
+                ),
                 text(format!(
                     "Native volume: {} {}",
                     presentation::quantity_exact(candle.volume),
@@ -2251,10 +3721,170 @@ impl Desktop {
                 ))
                 .size(12),
                 tooltip::Position::Top,
-            )
+            );
+            column![
+                text(format!(
+                    "{} UTC · {}",
+                    chart::utc(candle.time, "%Y-%m-%d %H:%M"),
+                    if self.chart.inspected().is_some() {
+                        "Inspecting"
+                    } else {
+                        "Latest candle"
+                    }
+                ))
+                .size(10)
+                .font(iced::Font::MONOSPACE)
+                .style(ui::muted_text),
+                row![
+                    value("O", self.chart.format_price(candle.open)),
+                    value("H", self.chart.format_price(candle.high)),
+                    value("L", self.chart.format_price(candle.low)),
+                    value("C", self.chart.format_price(candle.close)),
+                    volume,
+                ]
+                .spacing(10)
+                .wrap(),
+            ]
+            .spacing(4)
             .into()
         } else {
-            text(ohlc).size(13).into()
+            text(format!(
+                "Waiting for native {} · {} candles",
+                self.chart.market.symbol, self.chart.market.interval
+            ))
+            .size(12)
+            .style(ui::muted_text)
+            .into()
+        };
+        // Inspection is content, not layout: reserve its single-line slot while
+        // any current-native profile is visible, including while data loads.
+        let native = NativeInstrument::from_market(&self.chart.market);
+        let readout: Element<'_, Message> = if self.chart.profiles.iter().any(|profile| {
+            profile.visible
+                && profile
+                    .instrument
+                    .as_ref()
+                    .is_none_or(|bound| bound == &native)
+        }) {
+            let inspection = self
+                .profile_inspection()
+                .unwrap_or_else(|| iced::widget::Space::new(Length::Fill, Length::Shrink).into());
+            column![
+                readout,
+                container(inspection)
+                    .width(Length::Fill)
+                    .height(16)
+                    .clip(true)
+            ]
+            .spacing(4)
+            .into()
+        } else {
+            readout
+        };
+        let drawing_toolbar: Option<Element<'_, Message>> = if self.drawing_interaction.tool()
+            != DrawingTool::Select
+            || self.drawings.selected().is_some()
+        {
+            let mut controls = row![].spacing(4).align_y(iced::Alignment::Center);
+            if self.drawing_interaction.tool() != DrawingTool::Select {
+                controls = controls.push(ui::badge(
+                    format!(
+                        "{}{}",
+                        drawing_tool_name(self.drawing_interaction.tool()),
+                        if self.drawing_interaction.repeat() {
+                            " · repeat"
+                        } else {
+                            ""
+                        }
+                    ),
+                    ui::Tone::Accent,
+                ));
+            }
+            if let Some(drawing) = self.drawings.selected_drawing() {
+                let generation = self.drawings.generation();
+                controls = controls
+                    .push(
+                        text(format!(
+                            "{} #{}{}",
+                            drawing_tool_name(drawing.shape.tool()),
+                            drawing.id,
+                            if drawing.locked { " · locked" } else { "" }
+                        ))
+                        .size(11),
+                    )
+                    .push(
+                        button(text("Edit").size(11))
+                            .style(ui::quiet)
+                            .padding([4, 6])
+                            .on_press_maybe(
+                                (!blocked).then_some(Message::DrawingProperties(drawing.id)),
+                            ),
+                    )
+                    .push(
+                        button(text(if drawing.visible { "Hide" } else { "Show" }).size(11))
+                            .style(ui::quiet)
+                            .padding([4, 6])
+                            .on_press_maybe((!blocked).then_some(Message::DrawingCommand {
+                                generation,
+                                command: DrawingCommand::SetVisible {
+                                    id: drawing.id,
+                                    visible: !drawing.visible,
+                                },
+                            })),
+                    )
+                    .push(
+                        button(text(if drawing.locked { "Unlock" } else { "Lock" }).size(11))
+                            .style(ui::quiet)
+                            .padding([4, 6])
+                            .on_press_maybe((!blocked).then_some(Message::DrawingCommand {
+                                generation,
+                                command: DrawingCommand::SetLocked {
+                                    id: drawing.id,
+                                    locked: !drawing.locked,
+                                },
+                            })),
+                    )
+                    .push(
+                        button(text("Delete").size(11))
+                            .style(ui::danger)
+                            .padding([4, 6])
+                            .on_press_maybe((!blocked).then_some(Message::DrawingCommand {
+                                generation,
+                                command: DrawingCommand::Delete(drawing.id),
+                            })),
+                    );
+                controls = controls.push(self.drawing_controls.context_style_view(&self.drawings));
+            } else {
+                controls = controls
+                    .push(text(drawing_tool_name(self.drawing_interaction.tool())).size(11))
+                    .push(
+                        text("Click anchors or arrows + Enter")
+                            .size(10)
+                            .style(ui::muted_text),
+                    );
+            }
+            controls = controls.push(
+                iced::widget::checkbox("Repeat", self.drawing_interaction.repeat())
+                    .size(14)
+                    .text_size(11)
+                    .on_toggle(|enabled| {
+                        Message::DrawingControl(drawing_controls::Event::Repeat(enabled))
+                    }),
+            );
+            controls = controls.push(
+                button(ui::key("Esc"))
+                    .style(ui::quiet)
+                    .padding(2)
+                    .on_press_maybe((!blocked).then_some(Message::DrawingCancel)),
+            );
+            Some(
+                container(controls.wrap())
+                    .padding(6)
+                    .style(ui::panel)
+                    .into(),
+            )
+        } else {
+            None
         };
         let mut charts = column![].spacing(6);
         let has_lower = self
@@ -2262,16 +3892,80 @@ impl Desktop {
             .indicators
             .instances
             .iter()
-            .any(|item| item.visible && !item.spec.is_overlay());
+            .any(|item| item.visible && !item.spec.is_overlay())
+            && !self.chart.maximized();
         let mut legends = column![].spacing(2);
         let mut overlay_height = 0.0_f32;
-        for instance in self
-            .chart
-            .indicators
-            .instances
-            .iter()
-            .filter(|item| item.visible && item.spec.is_overlay())
-        {
+        if self.chart.pane_should_render(None) {
+            let instrument = NativeInstrument::from_market(&self.chart.market);
+            for profile in self.chart.profiles.iter().filter(|profile| {
+                profile.visible
+                    && profile
+                        .instrument
+                        .as_ref()
+                        .is_none_or(|key| key == &instrument)
+            }) {
+                let snapshot = self
+                    .profiles
+                    .outputs
+                    .get(&profile.id)
+                    .and_then(|items| items.last());
+                let status = if self.profiles.errors.contains_key(&profile.id) {
+                    "Unavailable"
+                } else if let Some(snapshot) = snapshot {
+                    if snapshot.volume_method == mexc_indicators::profiles::VolumeMethod::Estimated
+                    {
+                        "Estimated"
+                    } else if snapshot.volume_method
+                        == mexc_indicators::profiles::VolumeMethod::Mixed
+                    {
+                        "Mixed"
+                    } else if !snapshot.covered {
+                        "Partial"
+                    } else if snapshot.complete {
+                        "Complete"
+                    } else {
+                        "Developing"
+                    }
+                } else {
+                    "Loading"
+                };
+                let title = if profile.spec.kind == mexc_indicators::profiles::Kind::Volume {
+                    format!("#{} Volume · {}", profile.id, self.native_volume_unit)
+                } else {
+                    format!("#{} TPO · {}", profile.id, profile.spec.range)
+                };
+                legends = legends.push(
+                    row![
+                        ui::badge(title, ui::Tone::Accent),
+                        ui::badge(
+                            status,
+                            if status == "Complete" {
+                                ui::Tone::Positive
+                            } else {
+                                ui::Tone::Neutral
+                            }
+                        ),
+                        button(text("Settings").size(11))
+                            .style(ui::quiet)
+                            .on_press_maybe((!blocked).then_some(Message::Profile(
+                                profile_controls::Event::Open(Some(profile.id))
+                            ))),
+                        button(text("Hide").size(11))
+                            .style(ui::quiet)
+                            .on_press_maybe((!blocked).then_some(Message::Profile(
+                                profile_controls::Event::ToggleVisible(profile.id)
+                            ))),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                );
+                overlay_height += 30.0;
+            }
+        }
+        for instance in self.chart.indicators.instances.iter().filter(|item| {
+            item.visible && item.spec.is_overlay() && self.chart.pane_should_render(None)
+        }) {
             overlay_height += chart::legend_height(instance) + 2.0;
             legends = legends.push(chart::legend_view(
                 &self.chart,
@@ -2279,7 +3973,7 @@ impl Desktop {
                 self.theme_file.palette,
                 &self.native_volume_unit,
                 blocked,
-                self.source_problem(instance),
+                self.indicator_source_health(instance),
             ));
         }
         if overlay_height > 0.0 {
@@ -2289,43 +3983,62 @@ impl Desktop {
                     .height(overlay_height.min(120.0)),
             );
         }
-        charts = charts.push(chart::view(
-            chart::Chart {
-                data: &self.chart,
-                cache: &self.cache,
-                palette: self.theme_file.palette,
-                indicator: None,
-                quote: &self.native_quote,
-                volume_unit: &self.native_volume_unit,
-                drawings: Some(drawing_layer::View {
-                    store: &self.drawings,
-                    interaction: &self.drawing_interaction,
-                    scene: &self.drawing_scene,
-                    projection: &self.drawing_projection,
-                }),
-            },
-            if has_lower {
+        if self.chart.pane_should_render(None) {
+            let height = if has_lower {
                 Length::Fixed(self.chart.plot_height(None))
             } else {
                 Length::Fill
-            },
-            blocked,
-        ));
-        if has_lower {
-            charts = charts.push(pane_resize::view(
-                None,
-                self.chart.plot_height(None),
-                self.theme_file.palette,
+            };
+            let price = chart::view(
+                chart::Chart {
+                    data: &self.chart,
+                    cache: &self.cache,
+                    palette: self.theme_file.palette,
+                    indicator: None,
+                    quote: &self.native_quote,
+                    volume_unit: &self.native_volume_unit,
+                    drawings: Some(drawing_layer::View {
+                        store: &self.drawings,
+                        interaction: &self.drawing_interaction,
+                        scene: &self.drawing_scene,
+                        projection: &self.drawing_projection,
+                        native_candles: self.chart.candles(),
+                    }),
+                    profiles: Some(profile_layer::View {
+                        instances: &self.chart.profiles,
+                        outputs: &self.profiles.outputs,
+                        scene: &self.profile_scene,
+                        revision: self.profiles.revision,
+                        selected: self.selected_profile,
+                        market: &self.chart.market,
+                    }),
+                    profile_range: self.profile_range.as_ref().map(|placement| {
+                        profile_layer::RangePlacement {
+                            first: placement.first,
+                            cursor_ms: Some(placement.cursor_ms),
+                        }
+                    }),
+                    metrics: self.stress.as_ref(),
+                },
+                height,
                 blocked,
-            ));
+                drawing_toolbar.map(|toolbar| container(toolbar).padding(6).into()),
+                self.pointer_generation,
+            );
+            charts = charts.push(price);
+            if has_lower {
+                charts = charts.push(pane_resize::view(
+                    None,
+                    self.chart.plot_height(None),
+                    self.theme_file.palette,
+                    blocked,
+                    self.pointer_generation,
+                ));
+            }
         }
-        for instance in self
-            .chart
-            .indicators
-            .instances
-            .iter()
-            .filter(|item| item.visible && !item.spec.is_overlay())
-        {
+        for instance in self.chart.indicators.instances.iter().filter(|item| {
+            item.visible && !item.spec.is_overlay() && self.chart.pane_should_render(Some(item.id))
+        }) {
             if let Some(cache) = self.pane_caches.get(&instance.id) {
                 let mut pane = column![chart::legend_view(
                     &self.chart,
@@ -2333,32 +4046,47 @@ impl Desktop {
                     self.theme_file.palette,
                     &self.native_volume_unit,
                     blocked,
-                    self.source_problem(instance),
+                    self.indicator_source_health(instance),
                 )];
                 if !self.chart.pane_collapsed(instance.id) {
                     let height = self.chart.plot_height(Some(instance.id));
-                    pane = pane
-                        .push(chart::view(
-                            chart::Chart {
-                                data: &self.chart,
-                                cache,
-                                palette: self.theme_file.palette,
-                                indicator: Some(instance),
-                                quote: &self.native_quote,
-                                volume_unit: &self.native_volume_unit,
-                                drawings: None,
-                            },
-                            Length::Fixed(height),
-                            blocked,
-                        ))
-                        .push(pane_resize::view(
+                    pane = pane.push(chart::view(
+                        chart::Chart {
+                            data: &self.chart,
+                            cache,
+                            palette: self.theme_file.palette,
+                            indicator: Some(instance),
+                            quote: &self.native_quote,
+                            volume_unit: &self.native_volume_unit,
+                            drawings: None,
+                            profiles: None,
+                            profile_range: None,
+                            metrics: self.stress.as_ref(),
+                        },
+                        if self.chart.maximized() {
+                            Length::Fill
+                        } else {
+                            Length::Fixed(height)
+                        },
+                        blocked,
+                        None,
+                        self.pointer_generation,
+                    ));
+                    if !self.chart.maximized() {
+                        pane = pane.push(pane_resize::view(
                             Some(instance.id),
                             height,
                             self.theme_file.palette,
                             blocked,
+                            self.pointer_generation,
                         ));
+                    }
                 }
-                charts = charts.push(pane.spacing(2));
+                charts = charts.push(pane.spacing(2).height(if self.chart.maximized() {
+                    Length::Fill
+                } else {
+                    Length::Shrink
+                }));
             }
         }
         let charts: Element<'_, Message> = if has_lower {
@@ -2369,49 +4097,82 @@ impl Desktop {
         } else {
             charts.width(Length::Fill).height(Length::Fill).into()
         };
-        let market_control = button(text(&self.chart.market.symbol).size(19))
-            .on_press_maybe((!self.help_open).then_some(Message::Action(Action::ManageMarket)))
-            .padding([3, 6]);
-        let keys_control = button(text("Keys [?]").size(12))
-            .on_press_maybe((!self.help_open).then_some(Message::HelpOpen))
-            .padding([3, 6]);
+        let market_control = tooltip(
+            button(
+                column![
+                    text(&self.chart.market.symbol).size(18),
+                    text(format!(
+                        "{} · {} · {}",
+                        self.chart.market.exchange,
+                        if self.chart.market.product == Product::Spot {
+                            "Spot"
+                        } else {
+                            "Perp"
+                        },
+                        self.native_quote
+                    ))
+                    .size(10)
+                    .style(ui::muted_text),
+                ]
+                .spacing(2),
+            )
+            .style(ui::quiet)
+            .padding([4, 6])
+            .width(Length::Fill)
+            .on_press_maybe((!blocked).then_some(Message::Action(Action::ManageMarket))),
+            text("Choose native market · M").size(12),
+            tooltip::Position::Bottom,
+        );
         let interval_control: Element<'_, Message> = if !self.native_intervals().is_empty() {
             pick_list(
                 self.native_intervals(),
                 Some(self.chart.market.interval),
                 Message::SelectInterval,
             )
-            .text_size(14)
-            .padding([3, 6])
+            .text_size(12)
+            .padding([6, 8])
+            .width(70)
+            .style(ui::pick)
             .into()
         } else {
-            text(self.chart.market.interval.to_string()).size(14).into()
+            text(self.chart.market.interval.to_string()).size(12).into()
         };
-        let indicators_control = button(text("Indicators").size(14))
-            .on_press_maybe((!self.help_open).then_some(Message::Action(Action::ManageIndicators)))
-            .padding([3, 6]);
         let header = row![
             market_control,
-            text(format!(
-                "{} {} · {}",
-                self.chart.market.exchange, self.chart.market.product, self.native_quote
-            ))
-            .size(14),
             interval_control,
-            indicators_control,
-            button(text("Draw").size(14))
-                .padding([3, 6])
-                .on_press_maybe((!blocked).then_some(Message::DrawingMenu)),
-            iced::widget::Space::new(Length::Fill, Length::Shrink),
-            keys_control,
+            tooltip(
+                button(text("Indicators").size(12))
+                    .style(ui::quiet)
+                    .padding([6, 8])
+                    .on_press_maybe(
+                        (!blocked).then_some(Message::Action(Action::ManageIndicators))
+                    ),
+                text("Indicators · I").size(12),
+                tooltip::Position::Bottom
+            ),
+            tooltip(
+                button(text("Draw").size(12))
+                    .style(ui::quiet)
+                    .padding([6, 8])
+                    .on_press_maybe((!blocked).then_some(Message::DrawingMenu)),
+                text("Drawing palette · Ctrl+Shift+D").size(12),
+                tooltip::Position::Bottom
+            ),
+            tooltip(
+                button(text("?").size(14))
+                    .style(ui::quiet)
+                    .padding([6, 8])
+                    .on_press(Message::HelpOpen),
+                text("Keyboard & mouse actions · F1").size(12),
+                tooltip::Position::Bottom
+            ),
         ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center)
-        .wrap();
+        .spacing(5)
+        .align_y(iced::Alignment::Center);
         let status_control = |label: String| {
-            button(text(label).size(12))
-                .style(button::text)
-                .padding([3, 5])
+            button(text(label).size(11))
+                .style(ui::quiet)
+                .padding([4, 5])
                 .on_press(Message::StatusDetails)
         };
         let history_state = if self.history.error.is_some() {
@@ -2501,9 +4262,10 @@ impl Desktop {
         status_row = status_row.push(status_control("Details".into()));
         if !self.chart.viewport.live {
             status_row = status_row.push(tooltip(
-                button(text("Return to realtime").size(12))
-                    .on_press_maybe((!self.help_open).then_some(Message::Action(Action::Live)))
-                    .padding([3, 6]),
+                button(text("Go live").size(11))
+                    .style(ui::selected)
+                    .on_press_maybe((!blocked).then_some(Message::Action(Action::Live)))
+                    .padding([4, 8]),
                 text("Resume live following · L / End · keep manual value scales").size(12),
                 tooltip::Position::Top,
             ));
@@ -2511,90 +4273,89 @@ impl Desktop {
         if let Some(error) = &self.drawing_error {
             status_row = status_row.push(text(format!("Draw: {error}")).size(12));
         }
-        let mut content = column![header, readout].spacing(7);
-        if self.drawing_interaction.tool() != DrawingTool::Select
-            || self.drawings.selected().is_some()
-        {
-            let mut controls =
-                row![text(format!("Draw · {}", self.drawing_interaction.tool())).size(12)];
-            if let Some(drawing) = self.drawings.selected_drawing() {
-                let generation = self.drawings.generation();
-                controls =
-                    controls
-                        .push(
-                            text(format!(
-                                "#{} · {}{}",
-                                drawing.id,
-                                drawing.shape.tool(),
-                                if drawing.locked { " · locked" } else { "" }
-                            ))
-                            .size(12),
-                        )
-                        .push(button("Properties").padding([2, 5]).on_press_maybe(
-                            (!blocked).then_some(Message::DrawingProperties(drawing.id)),
-                        ))
-                        .push(
-                            button(if drawing.visible { "Hide" } else { "Show" })
-                                .padding([2, 5])
-                                .on_press_maybe((!blocked).then_some(Message::DrawingCommand {
-                                    generation,
-                                    command: DrawingCommand::SetVisible {
-                                        id: drawing.id,
-                                        visible: !drawing.visible,
-                                    },
-                                })),
-                        )
-                        .push(
-                            button(if drawing.locked { "Unlock" } else { "Lock" })
-                                .padding([2, 5])
-                                .on_press_maybe((!blocked).then_some(Message::DrawingCommand {
-                                    generation,
-                                    command: DrawingCommand::SetLocked {
-                                        id: drawing.id,
-                                        locked: !drawing.locked,
-                                    },
-                                })),
-                        )
-                        .push(button("Delete").padding([2, 5]).on_press_maybe(
-                            (!blocked).then_some(Message::DrawingCommand {
-                                generation,
-                                command: DrawingCommand::Delete(drawing.id),
-                            }),
-                        ));
-            } else {
-                controls = controls
-                    .push(text("Click anchors / arrows + Enter · Space-drag pans").size(12));
-            }
-            controls = controls.push(
-                button("Select / clear")
-                    .padding([2, 5])
-                    .on_press_maybe((!blocked).then_some(Message::DrawingCancel)),
+        if let Some(target) = self.chart.maximized_target() {
+            status_row = status_row.push(
+                button(text("Restore panes").size(11))
+                    .style(ui::selected)
+                    .on_press_maybe(
+                        (!blocked).then_some(Message::Action(Action::TogglePaneMaximized(target))),
+                    ),
             );
-            content = content.push(controls.spacing(5).align_y(iced::Alignment::Center).wrap());
         }
-        let content = content.push(charts).push(status_row.wrap());
+        if self.workspace.error.is_some() || self.workspace.warning.is_some() {
+            status_row = status_row.push(
+                button(text("Workspace attention").size(11))
+                    .style(ui::quiet)
+                    .on_press_maybe((!blocked).then_some(Message::StatusDetails)),
+            );
+        }
+        if let Some(notice) = &self.goto_notice {
+            status_row = status_row.push(text(notice).size(11).style(ui::muted_text));
+        }
+        let mut content = column![header, ui::separator(), readout].spacing(8);
+        if let Some(metrics) = &self.stress {
+            content = content.push(ui::badge(metrics.label(), ui::Tone::Accent));
+        }
+        let content = content
+            .push(charts)
+            .push(ui::separator())
+            .push(status_row.wrap());
         let base: Element<'_, Message> = container(content)
-            .padding(12)
+            .padding(10)
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
         let mut layers = iced::widget::stack![key_help::modal_background(base, blocked)]
             .width(Length::Fill)
             .height(Length::Fill);
-        let dialog = if self.manager.open {
-            Some((self.manager.view(&self.chart), Message::EditorClose))
+        let profile_navigation = |profiles: bool| {
+            row![
+                button("Indicators")
+                    .style(if profiles { ui::quiet } else { ui::selected })
+                    .on_press(Message::Action(Action::ManageIndicators)),
+                button("Profiles")
+                    .style(if profiles { ui::selected } else { ui::quiet })
+                    .on_press(Message::Profile(profile_controls::Event::Open(None))),
+            ]
+            .spacing(6)
+        };
+        let dialog = if self.profile_controls.open {
+            Some((
+                column![
+                    profile_navigation(true),
+                    key_help::profile_shortcuts(
+                        self.profile_controls
+                            .view(&self.chart.profiles, &self.profiles.outputs)
+                            .map(Message::Profile)
+                    ),
+                ]
+                .spacing(8)
+                .height(Length::Fill)
+                .into(),
+                Message::Profile(profile_controls::Event::Close),
+            ))
+        } else if self.manager.open {
+            Some((
+                column![profile_navigation(false), self.manager.view(&self.chart)]
+                    .spacing(8)
+                    .height(Length::Fill)
+                    .into(),
+                Message::EditorClose,
+            ))
         } else if self.selector.open {
             Some((self.selector.view(), Message::EditorClose))
         } else if self.drawing_controls.is_open() {
             Some((
                 self.drawing_controls.view(
                     &self.drawings,
+                    &self.chart.profiles,
                     self.drawing_interaction.tool(),
                     self.drawing_interaction.magnet(),
                     self.chart.latest().is_some(),
                     self.theme_file.palette,
                     self.chart.price_scale,
                     &self.native_quote,
+                    self.drawing_interaction.repeat(),
                 ),
                 Message::DrawingClose,
             ))
@@ -2604,22 +4365,85 @@ impl Desktop {
         };
         if let Some((body, close)) = dialog {
             layers = layers.push(key_help::modal_background(
-                dialog_layer(body, close, self.theme_file.palette),
-                self.help_open,
+                dialog_layer(
+                    body,
+                    close,
+                    if self.drawing_controls.is_open() && !self.drawing_controls.is_editing() {
+                        (380.0 + self.drawings.objects().len().min(6) as f32 * 42.0).min(660.0)
+                    } else if self.manager.open {
+                        self.manager.dialog_height(&self.chart)
+                    } else {
+                        720.0
+                    },
+                ),
+                self.help_open || self.commands.is_some(),
+            ));
+        }
+        if self.goto_time.open {
+            layers = layers.push(key_help::modal_background(
+                overlay_panel(
+                    self.goto_time.view(),
+                    Message::GotoTime(goto_time::Event::Close),
+                ),
+                self.help_open || self.commands.is_some(),
             ));
         }
         if self.help_open {
             layers = layers.push(key_help::view(self.help_context(), self.help_selection));
         }
-        layers.into()
+        if let Some(commands) = &self.commands {
+            layers = layers.push(overlay_panel(
+                commands.view(),
+                Message::CommandPalette(command_palette::Event::Escape),
+            ));
+        }
+        if self.workspace.controls.is_open() {
+            layers = layers.push(overlay_panel(
+                self.workspace.controls.view(
+                    self.workspace.reset_pending,
+                    self.workspace.error.as_deref(),
+                ),
+                Message::Workspace(workspace_controls::Event::Cancel),
+            ));
+        }
+        pointer_input::view(layers.into())
+    }
+}
+
+fn drawing_tool_name(tool: DrawingTool) -> &'static str {
+    match tool {
+        DrawingTool::Select => "Select",
+        DrawingTool::Horizontal => "Horizontal",
+        DrawingTool::Vertical => "Vertical",
+        DrawingTool::Trend => "Trend",
+        DrawingTool::Ray => "Ray",
+        DrawingTool::Rectangle => "Zone",
+        DrawingTool::Fibonacci => "Fibonacci",
+        DrawingTool::Text => "Text",
+        DrawingTool::Measure => "Measure",
+        DrawingTool::AnchoredVwap => "Anchored VWAP",
     }
 }
 
 fn dialog_layer<'a>(
     body: Element<'a, Message>,
     close: Message,
-    palette: palette::Palette,
+    max_height: f32,
 ) -> Element<'a, Message> {
+    let panel = container(body)
+        .padding(20)
+        .width(Length::Fill)
+        .max_width(760)
+        .height(Length::Fill)
+        .max_height(max_height)
+        .style(ui::panel);
+    overlay_panel(panel.into(), close)
+}
+
+fn overlay_panel<'a, R: iced::advanced::Renderer + 'a>(
+    body: Element<'a, Message, Theme, R>,
+    close: Message,
+) -> Element<'a, Message, Theme, R> {
     let backdrop = mouse_area(
         container(iced::widget::Space::new(Length::Fill, Length::Fill))
             .width(Length::Fill)
@@ -2631,24 +4455,11 @@ fn dialog_layer<'a>(
     )
     .on_press(close)
     .on_move(|_| Message::ModalBackdrop);
-    let panel = container(body)
-        .padding(16)
-        .width(Length::Fill)
-        .max_width(720)
-        .height(Length::Fill)
-        .max_height(680)
-        .style(move |_| container::Style {
-            background: Some(palette.background.into()),
-            border: iced::Border {
-                color: palette.muted,
-                width: 1.0,
-                radius: 8.0.into(),
-            },
-            ..Default::default()
-        });
     iced::widget::stack![
         backdrop,
-        container(panel)
+        // Containers do not capture presses on padding, labels, or controls
+        // that ignore a repeated click. Keep those presses off the backdrop.
+        container(iced::widget::opaque(body))
             .padding(16)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -2656,6 +4467,37 @@ fn dialog_layer<'a>(
             .align_y(iced::Alignment::Center),
     ]
     .into()
+}
+
+struct FindFocused(Option<iced::advanced::widget::Id>);
+
+impl iced::advanced::widget::Operation<Option<iced::advanced::widget::Id>> for FindFocused {
+    fn focusable(
+        &mut self,
+        state: &mut dyn iced::advanced::widget::operation::focusable::Focusable,
+        id: Option<&iced::advanced::widget::Id>,
+    ) {
+        if state.is_focused() {
+            self.0 = id.cloned();
+        }
+    }
+
+    fn container(
+        &mut self,
+        _id: Option<&iced::advanced::widget::Id>,
+        _bounds: iced::Rectangle,
+        children: &mut dyn FnMut(
+            &mut dyn iced::advanced::widget::Operation<Option<iced::advanced::widget::Id>>,
+        ),
+    ) {
+        children(self);
+    }
+
+    fn finish(
+        &self,
+    ) -> iced::advanced::widget::operation::Outcome<Option<iced::advanced::widget::Id>> {
+        iced::advanced::widget::operation::Outcome::Some(self.0.clone())
+    }
 }
 
 fn zoom(time: f64, price: f64) -> Action {
@@ -2743,9 +4585,15 @@ fn key_action(key: keyboard::Key<&str>, modifiers: keyboard::Modifiers) -> Optio
 fn main() -> iced::Result {
     iced::application(Desktop::title, Desktop::update, Desktop::view)
         .theme(Desktop::theme)
+        .settings(iced::Settings {
+            default_text_size: iced::Pixels(14.0),
+            antialiasing: true,
+            ..iced::Settings::default()
+        })
         .subscription(Desktop::subscription)
         .window_size((1200.0, 760.0))
-        .run_with(Desktop::new)
+        .exit_on_close_request(false)
+        .run_with(Desktop::launch)
 }
 
 #[cfg(test)]
@@ -2758,6 +4606,294 @@ mod tests {
         }
     }
     use super::*;
+    use iced::widget::column;
+
+    fn modal_event(
+        modal: &mut Element<'_, Message, Theme, ()>,
+        tree: &mut iced::advanced::widget::Tree,
+        node: &iced::advanced::layout::Node,
+        event: iced::mouse::Event,
+        position: iced::Point,
+        messages: &mut Vec<Message>,
+    ) -> iced::event::Status {
+        modal.as_widget_mut().on_event(
+            tree,
+            iced::Event::Mouse(event),
+            iced::advanced::Layout::new(node),
+            iced::mouse::Cursor::Available(position),
+            &(),
+            &mut iced::advanced::clipboard::Null,
+            &mut iced::advanced::Shell::new(messages),
+            &iced::Rectangle::with_size(iced::Size::new(800.0, 600.0)),
+        )
+    }
+
+    #[test]
+    fn modal_blank_content_and_reselected_controls_do_not_dismiss_but_outside_does() {
+        use iced::mouse::{Button, Event};
+        let body = container(column![
+            container(iced::widget::radio("Chart", true, Some(true), |_| {
+                Message::Manager(indicator_manager::Event::SourceMode(
+                    mexc_indicators::SourceMode::Chart,
+                ))
+            }))
+            .height(32),
+            button("Apply")
+                .on_press(Message::Manager(indicator_manager::Event::Submit))
+                .width(Length::Fill)
+                .height(32),
+            iced::widget::Space::new(Length::Fill, Length::Fill),
+        ])
+        .padding(10)
+        .width(240)
+        .height(160);
+        let mut modal: Element<'_, Message, Theme, ()> =
+            overlay_panel(body.into(), Message::EditorClose);
+        let mut tree = iced::advanced::widget::Tree::new(modal.as_widget());
+        let node = modal.as_widget().layout(
+            &mut tree,
+            &(),
+            &iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(800.0, 600.0)),
+        );
+        let mut messages = Vec::new();
+        // The fixed 240x160 body is centered at (280, 220). Both blank
+        // content and an already-selected radio normally ignore the press.
+        for position in [
+            iced::Point::new(300.0, 242.0),
+            iced::Point::new(300.0, 340.0),
+            iced::Point::new(282.0, 222.0),
+        ] {
+            assert_eq!(
+                modal_event(
+                    &mut modal,
+                    &mut tree,
+                    &node,
+                    Event::ButtonPressed(Button::Left),
+                    position,
+                    &mut messages,
+                ),
+                iced::event::Status::Captured,
+            );
+            modal_event(
+                &mut modal,
+                &mut tree,
+                &node,
+                Event::CursorMoved {
+                    position: iced::Point::new(10.0, 10.0),
+                },
+                iced::Point::new(10.0, 10.0),
+                &mut messages,
+            );
+            modal_event(
+                &mut modal,
+                &mut tree,
+                &node,
+                Event::ButtonReleased(Button::Left),
+                iced::Point::new(10.0, 10.0),
+                &mut messages,
+            );
+        }
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, Message::EditorClose))
+        );
+        let apply = iced::Point::new(300.0, 278.0);
+        for event in [
+            Event::ButtonPressed(Button::Left),
+            Event::ButtonReleased(Button::Left),
+        ] {
+            modal_event(&mut modal, &mut tree, &node, event, apply, &mut messages);
+        }
+        assert!(
+            messages.iter().any(|message| matches!(
+                message,
+                Message::Manager(indicator_manager::Event::Submit)
+            ))
+        );
+        modal_event(
+            &mut modal,
+            &mut tree,
+            &node,
+            Event::ButtonPressed(Button::Left),
+            iced::Point::new(10.0, 10.0),
+            &mut messages,
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, Message::EditorClose))
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn batched_pointer_events_use_the_press_position_not_the_end_of_frame_cursor() {
+        use iced::mouse::{Button, Event};
+        let body = container(iced::widget::Space::new(Length::Fill, Length::Fill))
+            .width(240)
+            .height(160);
+        let mut modal: Element<'_, Message, Theme, ()> =
+            pointer_input::view(overlay_panel(body.into(), Message::EditorClose));
+        let mut tree = iced::advanced::widget::Tree::new(modal.as_widget());
+        let node = modal.as_widget().layout(
+            &mut tree,
+            &(),
+            &iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(800.0, 600.0)),
+        );
+        let inside = iced::Point::new(300.0, 340.0);
+        let outside = iced::Point::new(10.0, 10.0);
+        let mut messages = Vec::new();
+        // iced 0.13 supplies the final cursor snapshot to every event in a batch.
+        for event in [
+            Event::CursorMoved { position: inside },
+            Event::ButtonPressed(Button::Left),
+            Event::CursorMoved { position: outside },
+            Event::ButtonReleased(Button::Left),
+        ] {
+            modal_event(&mut modal, &mut tree, &node, event, outside, &mut messages);
+        }
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, Message::EditorClose)),
+            "an inside press must not become an outside press when the cursor moves later",
+        );
+        for event in [
+            Event::CursorMoved { position: outside },
+            Event::ButtonPressed(Button::Left),
+            Event::CursorMoved { position: inside },
+            Event::ButtonReleased(Button::Left),
+        ] {
+            modal_event(&mut modal, &mut tree, &node, event, inside, &mut messages);
+        }
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, Message::EditorClose))
+                .count(),
+            1,
+            "an outside press must still dismiss when the cursor moves inside later",
+        );
+    }
+
+    #[test]
+    fn modal_dropdown_overlay_selects_beyond_panel_without_backdrop_dismissal() {
+        use iced::mouse::{Button, Event};
+        let body = container(column![
+            pick_list(
+                [
+                    mexc_indicators::CvdReset::Continuous,
+                    mexc_indicators::CvdReset::UtcDay
+                ],
+                Some(mexc_indicators::CvdReset::Continuous),
+                |reset| Message::Manager(indicator_manager::Event::Reset(reset)),
+            )
+            .width(Length::Fill)
+            .padding(6),
+            iced::widget::Space::new(Length::Fill, 32),
+        ])
+        .width(240)
+        .height(64);
+        let mut modal: Element<'_, Message, Theme, ()> =
+            pointer_input::view(overlay_panel(body.into(), Message::EditorClose));
+        let mut tree = iced::advanced::widget::Tree::new(modal.as_widget());
+        let size = iced::Size::new(800.0, 600.0);
+        let node = modal.as_widget().layout(
+            &mut tree,
+            &(),
+            &iced::advanced::layout::Limits::new(iced::Size::ZERO, size),
+        );
+        let mut messages = Vec::new();
+        let picker = iced::Point::new(300.0, 284.0);
+        for event in [
+            Event::CursorMoved { position: picker },
+            Event::ButtonPressed(Button::Left),
+        ] {
+            modal_event(&mut modal, &mut tree, &node, event, picker, &mut messages);
+        }
+        let mut overlay = modal
+            .as_widget_mut()
+            .overlay(
+                &mut tree,
+                iced::advanced::Layout::new(&node),
+                &(),
+                iced::Vector::ZERO,
+            )
+            .expect("the modal must expose its child's open dropdown");
+        let menu_node = overlay.layout(&(), size);
+        // The menu opens below the picker, past the centered panel's bottom.
+        let selection = iced::Point::new(300.0, 350.0);
+        assert!(overlay.is_over(iced::advanced::Layout::new(&menu_node), &(), selection));
+        for event in [
+            Event::CursorMoved {
+                position: selection,
+            },
+            Event::ButtonPressed(Button::Left),
+        ] {
+            let status = overlay.on_event(
+                iced::Event::Mouse(event),
+                iced::advanced::Layout::new(&menu_node),
+                iced::mouse::Cursor::Available(selection),
+                &(),
+                &mut iced::advanced::clipboard::Null,
+                &mut iced::advanced::Shell::new(&mut messages),
+            );
+            if matches!(event, Event::ButtonPressed(_)) {
+                assert_eq!(status, iced::event::Status::Captured);
+            }
+        }
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            Message::Manager(indicator_manager::Event::Reset(
+                mexc_indicators::CvdReset::UtcDay
+            ))
+        )));
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, Message::EditorClose))
+        );
+        drop(overlay);
+        // The overlay consumed the motion to this point. The next base click
+        // must not reuse the earlier picker position and accidentally reopen it.
+        for event in [
+            Event::ButtonReleased(Button::Left),
+            Event::ButtonPressed(Button::Left),
+        ] {
+            modal_event(
+                &mut modal,
+                &mut tree,
+                &node,
+                event,
+                selection,
+                &mut messages,
+            );
+        }
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, Message::EditorClose))
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn escape_cancels_indicator_editor_even_when_a_control_captured_the_key() {
+        let (mut desktop, _) = Desktop::new();
+        let _ = desktop.update(Message::Action(Action::ManageIndicators));
+        assert!(desktop.manager.open);
+        let before = desktop.chart.indicators.instances.len();
+        let _ = desktop.update(Message::Key {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modifiers: keyboard::Modifiers::default(),
+            captured: true,
+        });
+        assert!(!desktop.manager.open);
+        assert_eq!(desktop.chart.indicators.instances.len(), before);
+    }
 
     fn page(oldest: i64, next_before: Option<i64>) -> HistoryPage {
         HistoryPage {
@@ -2798,6 +4934,70 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn vwap_origin_history_pages_without_moving_the_chart_or_restarting_at_loaded_history() {
+        let (mut desktop, _) = Desktop::new();
+        let origin = 2 * 86_400;
+        let first = origin + 12 * 3600;
+        let mut initial = page(first, Some(first));
+        initial.candles.push(mexc_model::Candle {
+            time: first + 3600,
+            ..initial.candles[0]
+        });
+        desktop.apply_history_page(Arc::new(initial), Request::Recent, 0);
+        desktop.history.in_flight = false;
+        desktop.chart.viewport.left = (first + 1800) as f64;
+        desktop.chart.viewport.span = 1800.0;
+        desktop.chart.viewport.live = false;
+        let view = desktop.chart.viewport;
+        let _ = desktop.update(Message::Action(Action::AddIndicator(IndicatorSpec::Vwap {
+            reset: mexc_indicators::profiles::Period::Day,
+        })));
+        assert_eq!(desktop.vwap_history_origin(), Some(origin));
+        assert!(desktop.history.in_flight);
+        assert_eq!(
+            desktop.chart.indicators.instances[0]
+                .vwap_context(1)
+                .unwrap()
+                .origin_ms,
+            origin * 1000
+        );
+        assert!(
+            !desktop.chart.indicators.instances[0]
+                .vwap_context(1)
+                .unwrap()
+                .covered
+        );
+        for (before, oldest) in [(first, origin + 6 * 3600), (origin + 6 * 3600, origin)] {
+            let _ = desktop.update(Message::History {
+                request: Request::Older { before },
+                market: desktop.chart.market.clone(),
+                generation: desktop.market_generation,
+                history_id: desktop.history.generation,
+                epoch: 0,
+                result: Ok(page(oldest, Some(oldest))),
+            });
+            assert_eq!(desktop.chart.oldest(), Some(oldest));
+            assert_eq!(
+                (
+                    desktop.chart.viewport.left,
+                    desktop.chart.viewport.span,
+                    desktop.chart.viewport.live
+                ),
+                (view.left, view.span, view.live)
+            );
+        }
+        assert!(!desktop.history.in_flight);
+        assert_eq!(
+            desktop.chart.indicators.instances[0]
+                .vwap_context(0)
+                .unwrap()
+                .origin_ms,
+            origin * 1000
+        );
+        assert!(desktop.backfill_vwap_origin().is_none());
     }
 
     #[test]
@@ -2964,6 +5164,7 @@ mod tests {
                         quote_coin: mexc_model::Quote::USDC,
                         settle_coin: "USDC".into(),
                         price_scale: 2,
+                        tick_size: None,
                         contract_size: 1.0,
                         inverse: false,
                         volume_unit: "contracts".into(),
@@ -3006,6 +5207,118 @@ mod tests {
         assert!(desktop.market_generation > current_generation);
         assert!(desktop.history.in_flight);
         assert_stale_callbacks_ignored(&mut desktop, &a, current_generation);
+    }
+
+    #[test]
+    fn maximizing_another_pane_moves_keyboard_target_to_the_visible_plot() {
+        let (mut desktop, _) = Desktop::new();
+        desktop
+            .chart
+            .dispatch(Action::AddIndicator(IndicatorSpec::Rsi { period: 14 }));
+        let id = desktop.chart.indicators.instances[0].id;
+        assert_eq!(desktop.chart.active_pane, None);
+        let _ = desktop.update(Message::Action(Action::TogglePaneMaximized(Some(id))));
+        assert_eq!(desktop.chart.maximized_target(), Some(Some(id)));
+        assert_eq!(desktop.chart.active_pane, Some(id));
+        assert!(!desktop.chart.pane_should_render(None));
+    }
+
+    #[test]
+    fn repeated_tool_shortcut_is_scoped_to_drawings_and_escape_disarms_it() {
+        let (mut desktop, _) = Desktop::new();
+        desktop.drawing_controls.open_menu(&desktop.drawings);
+        let repeat_key = || Message::Key {
+            key: keyboard::Key::Character("R".into()),
+            modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            captured: true,
+        };
+        let _ = desktop.update(repeat_key());
+        assert!(desktop.drawing_interaction.repeat());
+        let _ = desktop.update(Message::Key {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modifiers: keyboard::Modifiers::default(),
+            captured: true,
+        });
+        assert!(!desktop.drawing_controls.is_open());
+        assert!(!desktop.drawing_interaction.repeat());
+        desktop.manager.open = true;
+        let _ = desktop.update(repeat_key());
+        assert!(!desktop.drawing_interaction.repeat());
+    }
+
+    #[test]
+    fn utc_jump_pages_chronologically_until_the_requested_native_range_is_loaded() {
+        let (mut desktop, _) = Desktop::new();
+        desktop.apply_history_page(Arc::new(page(900, Some(900))), Request::Recent, 0);
+        desktop.history.in_flight = false;
+        let _ = desktop.update(Message::GotoTimeOpen);
+        let _ = desktop.update(Message::GotoTime(goto_time::Event::Changed(
+            "1970-01-01 00:05:00".into(),
+        )));
+        let _ = desktop.update(Message::GotoTime(goto_time::Event::Submit));
+        assert_eq!(desktop.goto_target, Some(300));
+        assert_eq!(desktop.goto_page_oldest, Some(900));
+        assert!(desktop.history.in_flight);
+        let center = desktop.chart.viewport.left + desktop.chart.viewport.span * 0.5;
+        for (before, oldest, cursor) in [(900, 600, Some(600)), (600, 300, None)] {
+            let _ = desktop.update(Message::History {
+                request: Request::Older { before },
+                market: desktop.chart.market.clone(),
+                generation: desktop.market_generation,
+                history_id: desktop.history.generation,
+                epoch: 0,
+                result: Ok(page(oldest, cursor)),
+            });
+            assert_eq!(desktop.chart.oldest(), Some(oldest));
+            assert_eq!(
+                desktop.chart.viewport.left + desktop.chart.viewport.span * 0.5,
+                center
+            );
+            if cursor.is_some() {
+                assert_eq!(desktop.goto_target, Some(300));
+                assert_eq!(desktop.goto_page_oldest, Some(600));
+                assert!(desktop.history.in_flight);
+            }
+        }
+        assert_eq!(center, 300.0);
+        assert_eq!(desktop.goto_target, None);
+        assert!(!desktop.history.in_flight);
+        assert!(!desktop.chart.viewport.live);
+        assert_eq!(desktop.chart.inspection, None);
+        assert_eq!(
+            desktop
+                .chart
+                .candles()
+                .iter()
+                .map(|candle| candle.time)
+                .collect::<Vec<_>>(),
+            [300, 600, 900]
+        );
+    }
+
+    #[test]
+    fn utc_jump_rejects_a_nonadvancing_native_page_without_looping() {
+        let (mut desktop, _) = Desktop::new();
+        desktop.apply_history_page(Arc::new(page(900, Some(900))), Request::Recent, 0);
+        desktop.history.in_flight = false;
+        let _ = desktop.update(Message::GotoTimeOpen);
+        let _ = desktop.update(Message::GotoTime(goto_time::Event::Changed(
+            "1970-01-01 00:05:00".into(),
+        )));
+        let _ = desktop.update(Message::GotoTime(goto_time::Event::Submit));
+        let _ = desktop.update(Message::History {
+            request: Request::Older { before: 900 },
+            market: desktop.chart.market.clone(),
+            generation: desktop.market_generation,
+            history_id: desktop.history.generation,
+            epoch: 0,
+            result: Ok(page(900, Some(900))),
+        });
+        assert_eq!(desktop.goto_target, None);
+        assert!(!desktop.history.in_flight);
+        assert!(desktop.goto_time.open);
+        assert_eq!(desktop.chart.candles()[0].time, 900);
+        assert_eq!(desktop.chart.inspection, None);
     }
 
     #[test]
@@ -3527,6 +5840,7 @@ mod tests {
                 quote_coin: Quote::USDC,
                 settle_coin: "USDC".into(),
                 price_scale: 2,
+                tick_size: None,
                 contract_size: 0.0001,
                 inverse: false,
                 volume_unit: "contracts".into(),
@@ -3763,6 +6077,7 @@ mod tests {
                             quote_coin: Quote::USDC,
                             settle_coin: "USDC".into(),
                             price_scale: 2,
+                            tick_size: None,
                             contract_size: 1.0,
                             inverse: false,
                             volume_unit: "BTC".into(),
@@ -3848,8 +6163,8 @@ mod tests {
         );
         assert!(
             desktop
-                .source_problem(&desktop.chart.indicators.instances[0])
-                .is_some()
+                .indicator_source_health(&desktop.chart.indicators.instances[0])
+                .needs_repair()
         );
         let id = desktop.chart.indicators.instances[0].id;
         let okx = Market {
@@ -3902,9 +6217,9 @@ mod tests {
             Some(15.0)
         );
         assert!(
-            desktop
-                .source_problem(&desktop.chart.indicators.instances[0])
-                .is_none()
+            !desktop
+                .indicator_source_health(&desktop.chart.indicators.instances[0])
+                .needs_repair()
         );
 
         let _ = desktop.update(Message::SelectInterval(Timeframe::Hour8));
@@ -3945,6 +6260,7 @@ mod tests {
                 quote_coin: Quote::USDC,
                 settle_coin: "USDC".into(),
                 price_scale: 2,
+                tick_size: None,
                 contract_size: 1.0,
                 inverse: false,
                 volume_unit: "BTC".into(),
@@ -4351,5 +6667,85 @@ mod tests {
             })
         );
         assert!(!desktop.drawing_controls.is_open());
+    }
+
+    #[test]
+    fn window_cancellation_discards_preview_and_rejects_stale_pointer_release() {
+        use crate::drawing_types::{Anchor, Hit, Part, Shape, Style};
+        let (mut desktop, startup) = Desktop::new();
+        drop(startup);
+        desktop.chart.merge_page(&page(300, None), 0);
+        desktop.commit_drawing(DrawingCommand::Create {
+            shape: Shape::Horizontal(Anchor {
+                utc_ms: 300_000,
+                price: 1.0,
+            }),
+            style: Style::default(),
+        });
+        let id = desktop.drawings.selected().unwrap();
+        let original = desktop.drawings.find(id).unwrap().shape.clone();
+        let view = desktop.chart.viewport;
+        let projection = drawing_geometry::Projection::new(
+            view,
+            iced::Rectangle::with_size(iced::Size::new(1000.0, 800.0)),
+        )
+        .unwrap();
+        let generation = desktop.drawing_interaction.generation();
+        let _ = desktop.update(Message::DrawingInput {
+            generation,
+            event: drawing_interaction::Input::Down {
+                point: iced::Point::new(500.0, 400.0),
+                projection,
+                hit: Some(Hit {
+                    id,
+                    part: Part::Body,
+                }),
+                snap: None,
+            },
+        });
+        let moved = iced::Point::new(500.0, 500.0);
+        let _ = desktop.update(Message::DrawingInput {
+            generation,
+            event: drawing_interaction::Input::Move {
+                point: moved,
+                projection,
+                hit: None,
+                snap: None,
+            },
+        });
+        let _ = desktop.update(Message::Action(Action::Pan {
+            time: 0.2,
+            price: 0.2,
+        }));
+        assert_eq!(
+            (
+                desktop.chart.viewport.left,
+                desktop.chart.viewport.span,
+                desktop.chart.viewport.low,
+                desktop.chart.viewport.high,
+                desktop.chart.viewport.auto_fit,
+                desktop.chart.viewport.live
+            ),
+            (
+                view.left,
+                view.span,
+                view.low,
+                view.high,
+                view.auto_fit,
+                view.live
+            ),
+        );
+        let _ = desktop.update(Message::PointerCancelled);
+        let _ = desktop.update(Message::DrawingInput {
+            generation,
+            event: drawing_interaction::Input::Up {
+                point: moved,
+                projection,
+                snap: None,
+            },
+        });
+        assert_eq!(desktop.drawings.find(id).unwrap().shape, original);
+        assert!(!desktop.drawing_interaction.is_dragging());
+        assert_eq!(desktop.drawings.selected(), Some(id));
     }
 }

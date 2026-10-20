@@ -1,5 +1,9 @@
 #[path = "coinbase_flow.rs"]
 mod cvd;
+#[path = "coinbase_executions.rs"]
+mod executions;
+
+pub use executions::{execution_history, execution_session};
 
 use std::time::Duration;
 
@@ -9,6 +13,7 @@ use mexc_model::{
     Product, Quote, Timeframe,
 };
 use reqwest::Client;
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
@@ -81,6 +86,12 @@ fn scale(increment: &str) -> Result<u32> {
     u32::try_from(decimals).context("price precision exceeds supported range")
 }
 
+fn tick_size(increment: &str) -> Option<Decimal> {
+    Decimal::from_str_exact(increment)
+        .ok()
+        .filter(|increment| *increment > Decimal::ZERO)
+}
+
 fn spot_symbol(symbol: &str) -> Result<()> {
     if symbol.is_empty() || symbol.contains('/') || symbol.contains('?') || symbol.contains('#') {
         bail!("invalid Coinbase spot product id")
@@ -106,6 +117,7 @@ pub async fn catalog(client: &Client, product: Product) -> Result<Catalog> {
                         quote_coin,
                         settle_coin: row.quote_currency,
                         price_scale: scale(&row.quote_increment).ok()?,
+                        tick_size: tick_size(&row.quote_increment),
                         contract_size: 1.0,
                         inverse: false,
                         volume_unit: row.base_currency,
@@ -134,6 +146,8 @@ pub async fn catalog(client: &Client, product: Product) -> Result<Catalog> {
                         quote_coin,
                         settle_coin: row.quote_asset_name,
                         price_scale: scale(&row.quote_increment).ok()?,
+                        // INTX documents quote_increment as the minimum price change.
+                        tick_size: tick_size(&row.quote_increment),
                         contract_size,
                         inverse: false,
                         volume_unit: row.base_asset_name,
@@ -469,5 +483,20 @@ async fn price_stream(
             _ = shutdown.changed() => { if *shutdown.borrow() { return Ok(()); } }
             _ = time::sleep(Duration::from_secs(2)) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_quote_increment_is_not_inferred_from_display_precision() {
+        assert_eq!(tick_size("0.25000000"), Some(Decimal::new(25, 2)));
+        assert_eq!(scale("0.25000000").unwrap(), 2);
+        assert_eq!(tick_size("0.00000001"), Some(Decimal::new(1, 8)));
+        assert_eq!(tick_size("0"), None);
+        assert_eq!(tick_size("-0.01"), None);
+        assert_eq!(tick_size("not-an-increment"), None);
     }
 }

@@ -1,0 +1,80 @@
+name: Native desktop CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            artifact: mexc-chart-linux.tar.gz
+          - os: windows-latest
+            platform: windows
+            artifact: target/release/mexc-chart.exe
+          - os: macos-latest
+            platform: macos
+            artifact: mexc-chart-macos.tar.gz
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install Linux windowing prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libegl1-mesa-dev libgl1-mesa-dev
+
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Test locked workspace
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Check all targets with strict Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build optimized native desktop
+        run: cargo build --release --locked --package mexc-chart --bin mexc-chart
+
+      # Check the minimum language/API version separately from current lint rules.
+      - name: Install minimum supported Rust
+        if: runner.os == 'Linux'
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Check minimum supported Rust
+        if: runner.os == 'Linux'
+        run: cargo +1.89.0 check --workspace --all-targets --locked
+
+      # Tar preserves the executable bit that upload-artifact's ZIP otherwise drops.
+      - name: Archive Unix executable
+        if: runner.os != 'Windows'
+        run: tar -czf ${{ matrix.artifact }} -C target/release mexc-chart
+
+      - name: Upload native executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: mexc-chart-${{ matrix.platform }}-${{ runner.arch }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error

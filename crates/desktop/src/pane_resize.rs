@@ -16,13 +16,14 @@ struct Drag {
     pointer_y: f32,
     initial_height: f32,
     initial_bounds: Rectangle,
-    expected_height: f32,
+    requested_height: f32,
 }
 
 impl Drag {
     fn valid(&self, handle: &Handle, bounds: Rectangle) -> bool {
+        // The presented view can lag any number of pointer messages. Its height
+        // need not equal requested_height; its layout must still match that height.
         self.id == handle.id
-            && self.expected_height == handle.height
             && (bounds.x - self.initial_bounds.x).abs() <= GEOMETRY_TOLERANCE
             && (bounds.width - self.initial_bounds.width).abs() <= GEOMETRY_TOLERANCE
             && (bounds.height - self.initial_bounds.height).abs() <= GEOMETRY_TOLERANCE
@@ -31,8 +32,8 @@ impl Drag {
     }
 
     fn height_at(&self, pointer_y: f32) -> Option<f32> {
-        // Both positions are in window coordinates. Local bounds move while the
-        // plot grows, so using the current local pointer would cause feedback jitter.
+        // Both positions use the routed content coordinates of the scrollable.
+        // Local bounds move while the plot grows; do not feed that motion back in.
         bounded_plot_height(self.id, self.initial_height + (pointer_y - self.pointer_y))
     }
 }
@@ -68,8 +69,9 @@ pub fn view<'a>(
     height: f32,
     palette: Palette,
     blocked: bool,
+    input_generation: u64,
 ) -> Element<'a, Message> {
-    if blocked {
+    let canvas = if blocked {
         canvas::Canvas::new(BlockedHandle(palette))
             .width(Length::Fill)
             .height(HIT_HEIGHT)
@@ -83,7 +85,15 @@ pub fn view<'a>(
         .width(Length::Fill)
         .height(HIT_HEIGHT)
         .into()
-    }
+    };
+    crate::chart_surface::view(
+        canvas,
+        None,
+        Length::Fixed(HIT_HEIGHT),
+        blocked,
+        None,
+        (input_generation, id),
+    )
 }
 
 fn draw_grip(
@@ -177,13 +187,16 @@ impl canvas::Program<Message> for Handle {
                     pointer_y: pointer.y,
                     initial_height: self.height,
                     initial_bounds: bounds,
-                    expected_height: self.height,
+                    requested_height: self.height,
                 });
                 (Captured, None)
             }
-            canvas::Event::Mouse(mouse::Event::CursorMoved { position }) => {
+            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 let Some(drag) = state.drag.as_mut() else {
                     return (Ignored, None);
+                };
+                let Some(position) = cursor.position() else {
+                    return (Captured, None);
                 };
                 if state
                     .last_press
@@ -194,10 +207,10 @@ impl canvas::Program<Message> for Handle {
                 let Some(height) = drag.height_at(position.y) else {
                     return (Captured, None);
                 };
-                if height == drag.expected_height {
+                if height == drag.requested_height {
                     return (Captured, None);
                 }
-                drag.expected_height = height;
+                drag.requested_height = height;
                 (
                     Captured,
                     Some(Message::Action(Action::SetPaneHeight {
@@ -315,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn drag_uses_original_window_pointer_despite_moving_bounds_and_captures_outside_release() {
+    fn drag_uses_original_content_pointer_despite_moving_bounds_and_captures_outside_release() {
         let mut state = Interaction::default();
         press(&handle(Some(7), 190.0), &mut state, 400.0);
         for (height, origin, pointer_y, expected) in [
@@ -351,15 +364,216 @@ mod tests {
     }
 
     #[test]
-    fn stale_instance_height_and_unrelated_layout_changes_cancel_drag() {
+    fn motion_bursts_continue_before_render_and_through_partial_view_catch_up() {
+        for (id, initial_height) in [(None, 340.0), (Some(7), 190.0)] {
+            let mut state = Interaction::default();
+            let initial = handle(id, initial_height);
+            press(&initial, &mut state, 400.0);
+
+            // iced can deliver the whole burst to one view before applying messages.
+            for delta in (2..=40).step_by(2) {
+                let position = Point::new(900.0, 407.0 + delta as f32);
+                let (status, action) = input(
+                    &initial,
+                    &mut state,
+                    bounds(400.0),
+                    mouse::Event::CursorMoved { position },
+                    position,
+                );
+                assert_eq!(status, canvas::event::Status::Captured);
+                assert!(
+                    matches!(action, Some(Action::SetPaneHeight { id: target, height })
+                        if target == id && height == initial_height + delta as f32)
+                );
+                assert_eq!(
+                    initial.mouse_interaction(&state, bounds(400.0), mouse::Cursor::Unavailable),
+                    mouse::Interaction::ResizingVertically,
+                );
+            }
+
+            // Intermediate views, and a view skipping multiple acknowledgements,
+            // must not re-anchor the pointer or require the latest requested height.
+            for (presented_delta, pointer_delta) in
+                [(8.0, 44.0), (24.0, 48.0), (40.0, 52.0), (52.0, 56.0)]
+            {
+                let position = Point::new(900.0, 407.0 + pointer_delta);
+                let (status, action) = input(
+                    &handle(id, initial_height + presented_delta),
+                    &mut state,
+                    bounds(400.0 + presented_delta),
+                    mouse::Event::CursorMoved { position },
+                    position,
+                );
+                assert_eq!(status, canvas::event::Status::Captured);
+                assert!(
+                    matches!(action, Some(Action::SetPaneHeight { id: target, height })
+                        if target == id && height == initial_height + pointer_delta)
+                );
+            }
+
+            let caught_up = handle(id, initial_height + 56.0);
+            for delta in [60.0, 54.0, 70.0, 56.0, 72.0] {
+                let position = Point::new(900.0, 407.0 + delta);
+                let (status, action) = input(
+                    &caught_up,
+                    &mut state,
+                    bounds(456.0),
+                    mouse::Event::CursorMoved { position },
+                    position,
+                );
+                assert_eq!(status, canvas::event::Status::Captured);
+                assert!(
+                    matches!(action, Some(Action::SetPaneHeight { id: target, height })
+                        if target == id && height == initial_height + delta)
+                );
+            }
+            let (status, action) = input(
+                &handle(id, initial_height + 72.0),
+                &mut state,
+                bounds(472.0),
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+                Point::new(900.0, 900.0),
+            );
+            assert_eq!(status, canvas::event::Status::Captured);
+            assert!(action.is_none());
+            let position = Point::new(100.0, 500.0);
+            let (_, action) = input(
+                &handle(id, initial_height + 72.0),
+                &mut state,
+                bounds(472.0),
+                mouse::Event::CursorMoved { position },
+                position,
+            );
+            assert!(action.is_none());
+        }
+    }
+
+    #[test]
+    fn scrolled_drag_uses_routed_motion_and_ignores_unavailable_cursor() {
+        let mut state = Interaction::default();
+        let initial = handle(Some(7), 190.0);
+        press(&initial, &mut state, 800.0);
+        let scroll_offset = 450.0;
+        for delta in [3.0, 7.0, 19.0, 37.0] {
+            let position = Point::new(100.0, 807.0 + delta);
+            let raw_position = Point::new(position.x, position.y - scroll_offset);
+            let (status, action) = input(
+                &initial,
+                &mut state,
+                bounds(800.0),
+                mouse::Event::CursorMoved {
+                    position: raw_position,
+                },
+                position,
+            );
+            assert_eq!(status, canvas::event::Status::Captured);
+            assert!(
+                matches!(action, Some(Action::SetPaneHeight { id: Some(7), height })
+                    if height == 190.0 + delta)
+            );
+        }
+
+        let caught_up = handle(Some(7), 227.0);
+        let (status, action) = caught_up.update(
+            &mut state,
+            canvas::Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(100.0, 600.0),
+            }),
+            bounds(837.0),
+            mouse::Cursor::Unavailable,
+        );
+        assert_eq!(status, canvas::event::Status::Captured);
+        assert!(action.is_none());
+
+        let position = Point::new(100.0, 862.0);
+        let (status, action) = input(
+            &caught_up,
+            &mut state,
+            bounds(837.0),
+            mouse::Event::CursorMoved {
+                position: Point::new(position.x, position.y - scroll_offset),
+            },
+            position,
+        );
+        assert_eq!(status, canvas::event::Status::Captured);
+        assert!(matches!(
+            action,
+            Some(Action::SetPaneHeight {
+                id: Some(7),
+                height: 245.0
+            })
+        ));
+        let (status, action) = caught_up.update(
+            &mut state,
+            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            bounds(837.0),
+            mouse::Cursor::Unavailable,
+        );
+        assert_eq!(status, canvas::event::Status::Captured);
+        assert!(action.is_none());
+        assert!(state.drag.is_none());
+    }
+
+    #[test]
+    fn bounded_heights_remain_anchored_during_bursts_and_after_view_catch_up() {
+        for (id, initial_height, minimum, maximum) in
+            [(None, 340.0, 160.0, 1000.0), (Some(7), 190.0, 100.0, 800.0)]
+        {
+            let mut state = Interaction::default();
+            press(&handle(id, initial_height), &mut state, 400.0);
+            for (presented_height, delta, expected) in [
+                (initial_height, 1000.0, Some(maximum)),
+                (initial_height, 1100.0, None),
+                (initial_height, 1200.0, None),
+                (maximum, 10.0, Some(initial_height + 10.0)),
+                (initial_height + 10.0, -1000.0, Some(minimum)),
+                (initial_height + 10.0, -1100.0, None),
+                (minimum, 0.0, Some(initial_height)),
+            ] {
+                let position = Point::new(100.0, 407.0 + delta);
+                let (status, action) = input(
+                    &handle(id, presented_height),
+                    &mut state,
+                    bounds(400.0 + presented_height - initial_height),
+                    mouse::Event::CursorMoved { position },
+                    position,
+                );
+                assert_eq!(status, canvas::event::Status::Captured);
+                match expected {
+                    Some(expected) => assert!(
+                        matches!(action, Some(Action::SetPaneHeight { id: target, height })
+                            if target == id && height == expected)
+                    ),
+                    None => assert!(action.is_none()),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stale_instance_and_unrelated_layout_changes_cancel_drag() {
         for (replacement, moved_bounds) in [
             (handle(Some(8), 190.0), bounds(400.0)),
-            (handle(Some(7), 222.0), bounds(432.0)),
+            (handle(Some(7), 222.0), bounds(400.0)),
             (handle(Some(7), 190.0), bounds(370.0)),
             (
                 handle(Some(7), 190.0),
                 Rectangle {
                     width: 300.0,
+                    ..bounds(400.0)
+                },
+            ),
+            (
+                handle(Some(7), 190.0),
+                Rectangle {
+                    x: 40.0,
+                    ..bounds(400.0)
+                },
+            ),
+            (
+                handle(Some(7), 190.0),
+                Rectangle {
+                    height: 20.0,
                     ..bounds(400.0)
                 },
             ),
@@ -447,5 +661,67 @@ mod tests {
         );
         assert!(action.is_none());
         assert!(state.drag.is_none());
+    }
+
+    #[test]
+    fn pointer_updates_keep_capture_but_keyboard_resize_ends_the_old_gesture() {
+        use iced::advanced::widget::Tree;
+        let (mut app, startup) = crate::Desktop::new();
+        drop(startup);
+        let palette = Palette::default();
+        let initial_height = app.chart.plot_height(None);
+        let initial = view(None, initial_height, palette, false, app.pointer_generation);
+        let mut tree = Tree::new(initial.as_widget());
+        drop(initial);
+        press(
+            &handle(None, initial_height),
+            tree.children[0].state.downcast_mut::<Interaction>(),
+            400.0,
+        );
+        let position = Point::new(100.0, 447.0);
+        let (_, action) = input(
+            &handle(None, initial_height),
+            tree.children[0].state.downcast_mut::<Interaction>(),
+            bounds(400.0),
+            mouse::Event::CursorMoved { position },
+            position,
+        );
+        let _ = app.update(Message::Action(action.unwrap()));
+        let height = app.chart.plot_height(None);
+        let acknowledged = view(None, height, palette, false, app.pointer_generation);
+        tree.diff(acknowledged.as_widget());
+        drop(acknowledged);
+        let position = Point::new(100.0, 467.0);
+        let (_, action) = input(
+            &handle(None, height),
+            tree.children[0].state.downcast_mut::<Interaction>(),
+            bounds(400.0 + height - initial_height),
+            mouse::Event::CursorMoved { position },
+            position,
+        );
+        let _ = app.update(Message::Action(action.unwrap()));
+        assert_eq!(app.chart.plot_height(None), initial_height + 60.0);
+
+        let _ = app.update(Message::Action(Action::AdjustPaneHeight {
+            id: None,
+            delta: 20.0,
+        }));
+        let height = app.chart.plot_height(None);
+        assert_eq!(height, initial_height + 80.0);
+        let interrupted = view(None, height, palette, false, app.pointer_generation);
+        tree.diff(interrupted.as_widget());
+        drop(interrupted);
+        let position = Point::new(100.0, 487.0);
+        let (_, action) = input(
+            &handle(None, height),
+            tree.children[0].state.downcast_mut::<Interaction>(),
+            bounds(400.0 + height - initial_height),
+            mouse::Event::CursorMoved { position },
+            position,
+        );
+        if let Some(action) = action {
+            let _ = app.update(Message::Action(action));
+        }
+        assert_eq!(app.chart.plot_height(None), height);
     }
 }

@@ -7,24 +7,63 @@ use iced::widget::{
     button, checkbox, column, container, pick_list, radio, row, scrollable, text, text_input,
 };
 use iced::{Element, Length, Task, keyboard};
+use mexc_indicators::profiles::Period as VwapPeriod;
 use mexc_indicators::{CvdReset, IndicatorKind, IndicatorSource, IndicatorSpec, SourceMode};
 use mexc_model::{Catalog, Exchange, Instrument, Market, Product};
 use std::sync::Arc;
 
 const INSTANCES_ID: &str = "indicator-editor-instances";
-const INSTANCE_HEIGHT: f32 = 54.0;
+const INSTANCE_HEIGHT: f32 = 58.0;
 const INSTANCE_SPACING: f32 = 5.0;
 const SOURCE_EDITOR_ID: &str = "indicator-editor-parameters";
 const SOURCE_CANDIDATES_ID: &str = "indicator-source-candidates";
-const SOURCE_ROW_HEIGHT: f32 = 72.0;
+const SOURCE_ROW_HEIGHT: f32 = 56.0;
 const SOURCE_ROW_SPACING: f32 = 4.0;
 const SOURCE_VISIBLE_ROWS: usize = 3;
+
+#[derive(Debug, Clone, Copy)]
+pub enum ProfileEntry {
+    Tpo,
+    VisibleVolume,
+    SelectedVolume,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Choice {
+    Indicator(IndicatorKind),
+    Tpo,
+    VisibleVolume,
+}
+
+impl std::fmt::Display for Choice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Indicator(kind) => write!(f, "{kind}"),
+            Self::Tpo => f.write_str("TPO"),
+            Self::VisibleVolume => f.write_str("Visible Range Volume Profile"),
+        }
+    }
+}
+
+fn choices() -> [Choice; IndicatorKind::ALL.len() + 2] {
+    std::array::from_fn(|index| {
+        if index < IndicatorKind::ALL.len() {
+            Choice::Indicator(IndicatorKind::ALL[index])
+        } else if index == IndicatorKind::ALL.len() {
+            Choice::Tpo
+        } else {
+            Choice::VisibleVolume
+        }
+    })
+}
 
 #[derive(Debug, Clone)]
 pub enum Event {
     Kind(IndicatorKind),
+    Profile(ProfileEntry),
     Field(usize, String),
     Reset(CvdReset),
+    VwapPeriod(VwapPeriod),
     Select(u64),
     New,
     Submit,
@@ -45,6 +84,7 @@ pub struct Manager {
     kind: IndicatorKind,
     fields: [String; 3],
     cvd_reset: CvdReset,
+    vwap_period: VwapPeriod,
     field_ids: [text_input::Id; 3],
     error: Option<String>,
     source: IndicatorSource,
@@ -62,6 +102,7 @@ impl Default for Manager {
             kind: IndicatorKind::Sma,
             fields: Default::default(),
             cvd_reset: CvdReset::Continuous,
+            vwap_period: VwapPeriod::Day,
             field_ids: [
                 text_input::Id::new("indicator-parameter-0"),
                 text_input::Id::new("indicator-parameter-1"),
@@ -105,6 +146,23 @@ impl Manager {
             IndicatorSpec::Cvd { reset } => {
                 self.cvd_reset = reset;
                 Default::default()
+            }
+            IndicatorSpec::Vwap { reset } => {
+                self.vwap_period = reset;
+                if let VwapPeriod::Custom {
+                    timezone,
+                    start_minute,
+                    end_minute,
+                } = reset
+                {
+                    [
+                        timezone.name().into(),
+                        format!("{:02}:{:02}", start_minute / 60, start_minute % 60),
+                        format!("{:02}:{:02}", end_minute / 60, end_minute % 60),
+                    ]
+                } else {
+                    Default::default()
+                }
             }
             IndicatorSpec::OpenInterest => Default::default(),
         };
@@ -205,7 +263,7 @@ impl Manager {
 
     fn source_label(item: &Instrument) -> String {
         format!(
-            "{} · quote {} · settle {} · {}",
+            "{} · quote {} · settle {} · {} · volume {}",
             item.symbol,
             item.quote_coin,
             item.settle_coin,
@@ -213,7 +271,8 @@ impl Manager {
                 "inverse"
             } else {
                 "linear / spot"
-            }
+            },
+            item.volume_unit
         )
     }
 
@@ -283,6 +342,7 @@ impl Manager {
     fn focus_field(&self, index: usize) -> Task<Message> {
         let id = self.field_ids[index].clone();
         Task::batch([text_input::focus(id.clone()), text_input::select_all(id)])
+            .chain(self.reveal_focus())
     }
 
     fn focus_first_field(&self) -> Task<Message> {
@@ -327,6 +387,14 @@ impl Manager {
             IndicatorKind::Cvd => IndicatorSpec::Cvd {
                 reset: self.cvd_reset,
             },
+            IndicatorKind::Vwap => IndicatorSpec::Vwap {
+                reset: if matches!(self.vwap_period, VwapPeriod::Custom { .. }) {
+                    VwapPeriod::custom(&self.fields[0], &self.fields[1], &self.fields[2])
+                        .map_err(|error| (0, error))?
+                } else {
+                    self.vwap_period
+                },
+            },
             IndicatorKind::OpenInterest => IndicatorSpec::OpenInterest,
         };
         spec.validate().map_err(|error| {
@@ -352,7 +420,12 @@ impl Manager {
             IndicatorKind::Bollinger => &["Period", "Deviations"],
             IndicatorKind::Macd => &["Fast", "Slow", "Signal"],
             IndicatorKind::Stochastic => &["Period", "Smooth K", "Smooth D"],
-            IndicatorKind::Cvd | IndicatorKind::OpenInterest => &[],
+            IndicatorKind::Vwap if matches!(self.vwap_period, VwapPeriod::Custom { .. }) => &[
+                "IANA timezone",
+                "Local open · HH:MM inclusive",
+                "Local close · HH:MM exclusive",
+            ],
+            IndicatorKind::Cvd | IndicatorKind::OpenInterest | IndicatorKind::Vwap => &[],
             _ => &["Period"],
         }
     }
@@ -427,6 +500,7 @@ impl Manager {
     pub fn update(&mut self, event: Event, chart: &ChartState) -> (Option<Action>, Task<Message>) {
         self.error = None;
         match event {
+            Event::Profile(entry) => (None, Task::done(Message::ProfileEntry(entry))),
             Event::Kind(kind) => {
                 if kind != self.kind {
                     self.load(kind.default_spec());
@@ -447,6 +521,15 @@ impl Manager {
                     self.cvd_reset = reset;
                 }
                 (None, Task::none())
+            }
+            Event::VwapPeriod(period) => {
+                if self.kind == IndicatorKind::Vwap {
+                    self.vwap_period = period;
+                    if matches!(period, VwapPeriod::Custom { .. }) && self.fields[0].is_empty() {
+                        self.fields = ["UTC".into(), "00:00".into(), "00:00".into()];
+                    }
+                }
+                (None, self.focus_first_field())
             }
             Event::Select(id) => {
                 if self.selected == Some(id) {
@@ -629,6 +712,19 @@ impl Manager {
         chart: &ChartState,
     ) -> Option<Event> {
         use keyboard::{Key, key::Named};
+        if self.kind == IndicatorKind::Vwap
+            && modifiers.control()
+            && modifiers.shift()
+            && matches!(key, Key::Character("r" | "R"))
+        {
+            let index = VwapPeriod::ALL
+                .iter()
+                .position(|period| *period == self.vwap_period)
+                .unwrap_or(3);
+            return Some(Event::VwapPeriod(
+                VwapPeriod::ALL[(index + 1) % VwapPeriod::ALL.len()],
+            ));
+        }
         if self.supports_source() && modifiers.control() && modifiers.shift() {
             return match key {
                 Key::Character("r" | "R") if self.kind == IndicatorKind::Cvd => {
@@ -670,6 +766,10 @@ impl Manager {
                 Key::Character("s" | "S") => return Some(Event::Submit),
                 Key::Character("h" | "H") => return Some(Event::Toggle),
                 Key::Character("d" | "D") => return Some(Event::Remove),
+                Key::Character("t" | "T") => return Some(Event::Profile(ProfileEntry::Tpo)),
+                Key::Character("v" | "V") if !captured => {
+                    return Some(Event::Profile(ProfileEntry::VisibleVolume));
+                }
                 Key::Character("r" | "R") if self.supports_source() => {
                     return Some(Event::SourceRetry);
                 }
@@ -716,6 +816,25 @@ impl Manager {
         }
     }
 
+    pub fn reveal_focus(&self) -> Task<Message> {
+        crate::ui::reveal_focus(SOURCE_EDITOR_ID)
+    }
+
+    pub fn scroll_parameters(&self, amount: f32) -> Task<Message> {
+        scrollable::scroll_by(
+            scrollable::Id::new(SOURCE_EDITOR_ID),
+            scrollable::AbsoluteOffset { x: 0.0, y: amount },
+        )
+    }
+
+    pub fn dialog_height(&self, chart: &ChartState) -> f32 {
+        if self.supports_source() {
+            720.0
+        } else {
+            (360.0 + chart.indicators.instances.len().min(6) as f32 * 48.0).min(680.0)
+        }
+    }
+
     pub fn view<'a>(&'a self, chart: &'a ChartState) -> Element<'a, Message> {
         iced::widget::responsive(move |size| self.dialog_view(chart, size.width >= 600.0)).into()
     }
@@ -729,60 +848,103 @@ impl Manager {
             row![
                 text("Indicators").size(20),
                 iced::widget::Space::new(Length::Fill, Length::Shrink),
-                button("Keys [F1]").on_press(Message::HelpOpen)
+                button("Keys [F1]")
+                    .on_press(Message::HelpOpen)
+                    .style(crate::ui::quiet)
             ]
             .align_y(iced::Alignment::Center),
-            text(
-                self.selected
-                    .map_or_else(|| "New instance".to_owned(), |id| format!("Editing #{id}"))
-            )
-            .size(14),
+            crate::ui::separator(),
+            row![
+                crate::ui::badge(
+                    self.selected
+                        .map_or_else(|| "New".into(), |id| format!("Editing #{id}")),
+                    crate::ui::Tone::Accent,
+                ),
+                text("Draft until Add / Apply")
+                    .size(11)
+                    .style(crate::ui::muted_text),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
         ]
-        .spacing(4);
+        .spacing(6);
         let mut editor = column![
             text("Parameters").size(14),
             pick_list(
-                IndicatorKind::ALL,
-                Some(self.kind),
-                |kind| Message::Manager(Event::Kind(kind))
+                choices(),
+                Some(Choice::Indicator(self.kind)),
+                |choice| match choice {
+                    Choice::Indicator(kind) => Message::Manager(Event::Kind(kind)),
+                    Choice::Tpo => Message::ProfileEntry(ProfileEntry::Tpo),
+                    Choice::VisibleVolume => Message::ProfileEntry(ProfileEntry::VisibleVolume),
+                }
             )
-            .width(Length::Fill),
+            .width(Length::Fill)
+            .style(crate::ui::pick),
         ]
-        .spacing(8);
+        .spacing(7);
+        if self.kind == IndicatorKind::Vwap {
+            editor = editor
+                .push(text("VWAP reset · Ctrl+Shift+R").size(12).style(crate::ui::muted_text))
+                .push(pick_list(VwapPeriod::ALL,
+                    Some(if matches!(self.vwap_period, VwapPeriod::Custom { .. }) {
+                        VwapPeriod::ALL[3]
+                    } else { self.vwap_period }),
+                    |period| Message::Manager(Event::VwapPeriod(period)))
+                    .width(Length::Fill).style(crate::ui::pick))
+                .push(text("Candle VWAP: HLC3 weighted by native candle volume. UTC day/week/month or IANA daily session. Custom times run on all calendar days. Missing origin/history remains partial; candles crossing session boundaries are not split.")
+                    .width(Length::Fill).size(11).style(crate::ui::muted_text));
+        }
         for (index, label) in self.labels().iter().enumerate() {
             editor = editor.push(
-                column![
-                    text(*label).size(13),
-                    text_input(label, &self.fields[index])
-                        .id(self.field_ids[index].clone())
-                        .on_input(move |value| Message::Manager(Event::Field(index, value)))
-                        .on_submit(Message::Manager(Event::Submit))
-                        .padding(5),
-                ]
-                .spacing(6)
+                container(
+                    column![
+                        text(*label).size(12).style(crate::ui::muted_text),
+                        text_input(label, &self.fields[index])
+                            .id(self.field_ids[index].clone())
+                            .on_input(move |value| Message::Manager(Event::Field(index, value)))
+                            .on_submit(Message::Manager(Event::Submit))
+                            .padding(5)
+                            .style(crate::ui::input),
+                    ]
+                    .spacing(4),
+                )
+                .padding([6, 8])
+                .style(crate::ui::card)
                 .width(Length::Fill),
             );
         }
         if self.kind == IndicatorKind::Cvd {
             editor = editor
-                .push(text("Reset").size(13))
+                .push(text("Reset policy").size(12).style(crate::ui::muted_text))
                 .push(
                     pick_list(
                         [CvdReset::Continuous, CvdReset::UtcDay],
                         Some(self.cvd_reset),
                         |reset| Message::Manager(Event::Reset(reset)),
                     )
-                    .width(Length::Fill),
+                    .width(Length::Fill)
+                    .style(crate::ui::pick),
                 )
                 .push(
-                    text("UTC day resets at 00:00 UTC. A complete daily total requires trade coverage from UTC midnight.")
-                        .size(12),
+                    text("UTC day resets at 00:00 UTC. Complete daily totals require trade coverage from midnight.")
+                        .size(11)
+                        .style(crate::ui::muted_text),
                 );
         }
         if self.kind == IndicatorKind::OpenInterest {
-            editor = editor.push(
-                text("Chart: native quantity · external sources: base asset\nPerpetual observations, not candle-aligned or derived notional.").size(13),
-            );
+            editor = editor.push(crate::ui::hint(
+                row![
+                    crate::ui::badge(
+                        if self.source.is_chart() { "Native quantity" } else { "Base quantity" },
+                        crate::ui::Tone::Accent,
+                    ),
+                    crate::ui::badge("Actual observations", crate::ui::Tone::Neutral),
+                ]
+                .spacing(6)
+                .wrap(),
+                "Chart OI uses native outstanding quantity; external OI uses base-asset quantity. Perpetual observations are not candle-aligned or derived notional. Details retains timestamps, cadence, and provenance.",
+            ));
         }
         if self.supports_source() {
             let mut modes = row![].spacing(10);
@@ -804,27 +966,32 @@ impl Manager {
                 );
             }
             editor = editor
-                .push(text("Source · chart stays independent").size(14))
+                .push(crate::ui::hint(
+                    text("Data source").size(14),
+                    "Details shows CVD quality and accumulation origin, and OI source as-of times.",
+                ))
                 .push(modes.wrap());
             if !self.source.is_chart() {
                 editor = editor
                     .push(
-                        text(format!(
-                            "{} {} · base-asset quantity · every source required",
-                            chart.base_asset, chart.market.product
-                        ))
-                        .size(12),
+                        row![
+                            crate::ui::badge(
+                                format!("{} base qty", chart.base_asset),
+                                crate::ui::Tone::Accent
+                            ),
+                            crate::ui::badge("Every source required", crate::ui::Tone::Neutral),
+                        ]
+                        .spacing(6)
+                        .wrap(),
                     )
                     .push(
-                        text(if self.source.mode == SourceMode::Single {
-                            "Single: choosing a native market replaces all other draft choices."
-                        } else {
-                            "Selected / All: check each exact native market to include it."
+                        text(match self.source.mode {
+                            SourceMode::Single => "One exact market · replaces other draft choices",
+                            SourceMode::All => "Choose an exact market on every eligible venue",
+                            _ => "Include checked exact markets",
                         })
-                        .size(12),
-                    )
-                    .push(
-                        text("Exchanges · browse first, then choose exact native markets").size(13),
+                        .size(11)
+                        .style(crate::ui::muted_text),
                     );
                 for exchange in Exchange::ALL {
                     let chosen = self
@@ -841,62 +1008,86 @@ impl Manager {
                             market.exchange == exchange && self.eligible_market(market, chart)
                         })
                         .count();
-                    let mut status = match &self.source_catalogs[exchange.index()] {
-                        None => "discovery pending".to_owned(),
-                        Some(Err(error)) => format!("discovery failed: {error}"),
+                    let catalog = &self.source_catalogs[exchange.index()];
+                    let (status, tone) = match catalog {
+                        None => ("Pending".to_owned(), crate::ui::Tone::Neutral),
+                        Some(Err(_)) => ("Catalog failed".into(), crate::ui::Tone::Negative),
                         Some(Ok(_)) => {
                             let count = self.eligible_candidates(exchange, chart).count();
                             if count == 0 {
-                                "ineligible for this underlying/product/interval".into()
+                                ("Ineligible".into(), crate::ui::Tone::Neutral)
                             } else {
-                                format!("{count} eligible native markets")
+                                (format!("{count} eligible"), crate::ui::Tone::Positive)
                             }
                         }
                     };
-                    status.push_str(&format!(" · {chosen} chosen"));
+                    let mut labels = row![crate::ui::badge(status, tone)].spacing(5);
+                    if chosen > 0 {
+                        labels = labels.push(crate::ui::badge(
+                            format!("{chosen} chosen"),
+                            crate::ui::Tone::Accent,
+                        ));
+                    }
                     if chosen > valid_chosen {
-                        status.push_str(&format!(" · {} unavailable", chosen - valid_chosen));
+                        labels = labels.push(crate::ui::badge(
+                            format!("{} unavailable", chosen - valid_chosen),
+                            crate::ui::Tone::Negative,
+                        ));
                     }
                     if self.source.mode == SourceMode::All {
-                        status.push_str(match &self.source_catalogs[exchange.index()] {
-                            None => " · All pending",
-                            Some(Err(_)) => " · All failed: retry required",
+                        let (requirement, tone) = match catalog {
+                            None => ("All pending", crate::ui::Tone::Neutral),
+                            Some(Err(_)) => ("Retry required", crate::ui::Tone::Negative),
                             Some(Ok(_))
                                 if self.eligible_candidates(exchange, chart).next().is_none() =>
                             {
-                                " · All not required"
+                                ("Not required", crate::ui::Tone::Neutral)
                             }
-                            Some(Ok(_)) if valid_chosen == 0 => " · All required: MISSING",
-                            Some(Ok(_)) => " · All required: chosen",
-                        });
+                            Some(Ok(_)) if valid_chosen == 0 => {
+                                ("Required · missing", crate::ui::Tone::Negative)
+                            }
+                            Some(Ok(_)) => ("Required · chosen", crate::ui::Tone::Positive),
+                        };
+                        labels = labels.push(crate::ui::badge(requirement, tone));
                     }
                     let mut venue = row![
-                        checkbox(format!("{exchange}: {status}"), chosen > 0)
+                        checkbox(exchange.to_string(), chosen > 0)
                             .on_toggle(move |included| Message::Manager(
                                 Event::SourceVenueIncluded { exchange, included }
                             ))
                             .size(16)
                             .text_size(12)
-                            .width(Length::Fill),
-                        button(if exchange == self.source_exchange {
-                            "Browsing"
-                        } else {
-                            "Browse"
-                        })
-                        .on_press(Message::Manager(Event::SourceExchange(exchange)))
-                        .style(if exchange == self.source_exchange {
-                            button::primary
-                        } else {
-                            button::secondary
-                        }),
+                            .width(100),
+                        // Loosen flex-assigned width so wrapped badges stay compact.
+                        container(labels.wrap()).width(Length::Fill),
+                        button("Browse")
+                            .on_press(Message::Manager(Event::SourceExchange(exchange)))
+                            .style(if exchange == self.source_exchange {
+                                crate::ui::selected
+                            } else {
+                                crate::ui::quiet
+                            }),
                     ]
-                    .spacing(6)
+                    .spacing(4)
                     .align_y(iced::Alignment::Center);
                     if matches!(&self.source_catalogs[exchange.index()], Some(Err(_))) {
-                        venue = venue
-                            .push(button("Retry").on_press(Message::Manager(Event::SourceRetry)));
+                        venue = venue.push(
+                            button("Retry")
+                                .on_press(Message::Manager(Event::SourceRetry))
+                                .style(crate::ui::quiet),
+                        );
                     }
-                    editor = editor.push(venue);
+                    let mut content = column![venue.padding([3, 5])].spacing(4);
+                    if let Some(Err(error)) = catalog {
+                        content =
+                            content.push(text(error).size(11).style(crate::ui::negative_text));
+                    }
+                    editor = editor.push(
+                        container(content)
+                            .padding(4)
+                            .width(Length::Fill)
+                            .style(crate::ui::card),
+                    );
                 }
                 if let Some(Ok(catalog)) = &self.source_catalogs[Exchange::Mexc.index()]
                     && catalog
@@ -904,7 +1095,12 @@ impl Manager {
                         .iter()
                         .any(|item| item.base_coin == chart.base_asset && item.inverse)
                 {
-                    editor = editor.push(text("MEXC inverse contracts excluded: no authoritative base-quantity conversion. Choose a listed linear native market.").size(12));
+                    editor = editor.push(crate::ui::hint(
+                        text("MEXC inverse excluded · no authoritative base conversion")
+                            .size(11)
+                            .style(crate::ui::muted_text),
+                        "MEXC inverse contracts cannot contribute to base-quantity aggregates without authoritative conversion. Choose a listed linear native market.",
+                    ));
                 }
                 for market in &self.source.markets {
                     if self.eligible_market(market, chart) {
@@ -928,28 +1124,44 @@ impl Manager {
                             Self::source_label,
                         );
                     editor = editor.push(
-                        checkbox(
-                            format!(
-                                "{} {label} · unavailable: uncheck to remove",
-                                market.exchange
-                            ),
-                            true,
-                        )
-                        .on_toggle(move |chosen| {
-                            Message::Manager(Event::SetSourceMarket {
-                                market: market.clone(),
-                                chosen,
+                        checkbox(format!("{} · unavailable — uncheck to remove", label), true)
+                            .on_toggle(move |chosen| {
+                                Message::Manager(Event::SetSourceMarket {
+                                    market: market.clone(),
+                                    chosen,
+                                })
                             })
-                        })
-                        .size(16)
-                        .text_size(12)
-                        .width(Length::Fill),
+                            .size(15)
+                            .text_size(11)
+                            .width(Length::Fill),
                     );
                 }
                 editor = editor
-                    .push(text("Checks = included; > = keyboard cursor. Unchecking an exchange removes all its draft markets. All requires an exact choice on every eligible exchange.").size(12))
-                    .push(text("Ctrl+Shift+Left/Right: browse venue · Up/Down: cursor · Space: choose/uncheck · M: source mode · Ctrl+R: retry discovery").size(12))
-                    .push(text(format!("{} native markets", self.source_exchange)).size(13));
+                    .push(
+                        row![
+                            crate::ui::key("Ctrl+Shift+Space"),
+                            text("Choose focused market")
+                                .size(11)
+                                .style(crate::ui::muted_text),
+                        ]
+                        .spacing(5)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .push(text(format!("{} native markets", self.source_exchange)).size(12));
+                if self.kind == IndicatorKind::Cvd
+                    && let Some(Ok(catalog)) = &self.source_catalogs[self.source_exchange.index()]
+                {
+                    editor = editor.push(
+                        text(format!(
+                            "CVD source quality · history {:?} · live {:?} · {}",
+                            catalog.flow_support.history,
+                            catalog.flow_support.live,
+                            catalog.flow_support.description
+                        ))
+                        .size(11)
+                        .style(crate::ui::muted_text),
+                    );
+                }
                 let items = self.candidates(self.source_exchange, chart);
                 let count = items.len();
                 let mut candidates = column![].spacing(SOURCE_ROW_SPACING);
@@ -963,10 +1175,9 @@ impl Manager {
                     let checked = self.selected_market(&market);
                     let highlighted =
                         self.source_candidate.as_deref() == Some(item.symbol.as_str());
-                    let label = Self::source_label(item);
                     let control: Element<'a, Message> = if self.source.mode == SourceMode::Single {
                         radio(
-                            label,
+                            item.symbol.as_str(),
                             true,
                             (checked && self.source.markets.len() == 1).then_some(true),
                             move |_| {
@@ -981,7 +1192,7 @@ impl Manager {
                         .width(Length::Fill)
                         .into()
                     } else {
-                        checkbox(label, checked)
+                        checkbox(item.symbol.as_str(), checked)
                             .on_toggle(move |chosen| {
                                 Message::Manager(Event::SetSourceMarket {
                                     market: market.clone(),
@@ -997,7 +1208,26 @@ impl Manager {
                         container(
                             row![
                                 text(if highlighted { ">" } else { " " }).size(14).width(12),
-                                control
+                                column![
+                                    control,
+                                    text(format!(
+                                        "Quote {} · Settle {} · {} · Vol {}",
+                                        item.quote_coin,
+                                        item.settle_coin,
+                                        if item.product == Product::Spot {
+                                            "spot"
+                                        } else if item.inverse {
+                                            "inverse"
+                                        } else {
+                                            "linear"
+                                        },
+                                        item.volume_unit,
+                                    ))
+                                    .size(10)
+                                    .style(crate::ui::muted_text),
+                                ]
+                                .spacing(4)
+                                .width(Length::Fill),
                             ]
                             .spacing(4)
                             .align_y(iced::Alignment::Center),
@@ -1007,11 +1237,9 @@ impl Manager {
                         .width(Length::Fill)
                         .style(move |theme| {
                             if highlighted {
-                                container::Style {
-                                    background: None,
-                                    text_color: None,
-                                    ..container::bordered_box(theme)
-                                }
+                                let mut style = crate::ui::card(theme);
+                                style.border.color = theme.palette().primary;
+                                style
                             } else {
                                 container::transparent(theme)
                             }
@@ -1032,7 +1260,8 @@ impl Manager {
                 } else {
                     editor = editor.push(
                         text("No eligible native markets; discovery status is shown above.")
-                            .size(12),
+                            .size(11)
+                            .style(crate::ui::muted_text),
                     );
                 }
             }
@@ -1043,10 +1272,13 @@ impl Manager {
             } else {
                 "Add"
             })
-            .on_press(Message::Manager(Event::Submit)),
-            button("New").on_press(Message::Manager(Event::New)),
+            .on_press(Message::Manager(Event::Submit))
+            .style(crate::ui::primary),
+            button("New")
+                .on_press(Message::Manager(Event::New))
+                .style(crate::ui::quiet),
         ]
-        .spacing(6);
+        .spacing(4);
         if self.selected.is_some() {
             actions = actions
                 .push(
@@ -1063,17 +1295,30 @@ impl Manager {
                             "Show"
                         },
                     )
-                    .on_press(Message::Manager(Event::Toggle)),
+                    .on_press(Message::Manager(Event::Toggle))
+                    .style(crate::ui::quiet),
                 )
-                .push(button("Remove").on_press(Message::Manager(Event::Remove)));
+                .push(
+                    button("Remove")
+                        .on_press(Message::Manager(Event::Remove))
+                        .style(crate::ui::danger),
+                );
         }
         if let Some(id) = self.selected {
-            actions = actions.push(button("Details").on_press(Message::IndicatorDetails(id)));
+            actions = actions.push(
+                button("Details")
+                    .on_press(Message::IndicatorDetails(id))
+                    .style(crate::ui::quiet),
+            );
         }
-        actions = actions.push(button("Close").on_press(Message::Action(Action::ManageIndicators)));
-        let mut footer = column![].spacing(6);
+        actions = actions.push(
+            button("Close")
+                .on_press(Message::Action(Action::ManageIndicators))
+                .style(crate::ui::quiet),
+        );
+        let mut footer = column![crate::ui::separator()].spacing(6);
         if let Some(error) = self.error.as_ref().or(chart.indicator_error.as_ref()) {
-            footer = footer.push(text(error).size(13));
+            footer = footer.push(text(error).size(12).style(crate::ui::negative_text));
         }
         footer = footer.push(actions.width(Length::Fill).wrap());
         let mut instances = column![].spacing(INSTANCE_SPACING);
@@ -1082,29 +1327,38 @@ impl Manager {
             instances = instances.push(
                 button(
                     text(format!(
-                        "{} #{} {}\n{} · {}",
-                        if selected { ">" } else { " " },
+                        "#{} {} · {}\n{} · {}",
                         instance.id,
                         instance.spec.label(),
                         if instance.visible { "shown" } else { "hidden" },
-                        instance.source.label()
+                        instance.source.label(),
+                        if selected {
+                            "editing"
+                        } else {
+                            "select to edit"
+                        }
                     ))
-                    .size(13),
+                    .size(12),
                 )
                 .on_press(Message::Manager(Event::Select(instance.id)))
                 .width(Length::Fill)
                 .height(INSTANCE_HEIGHT)
                 .style(if selected {
-                    button::primary
+                    crate::ui::selected
                 } else {
-                    button::secondary
+                    crate::ui::quiet
                 }),
             );
         }
-        if chart.indicators.instances.is_empty() {
-            instances = instances.push(text("No indicators. Choose a type and Add.").size(13));
-        }
-        let middle: Element<'a, Message> = if side_by_side {
+        let middle: Element<'a, Message> = if chart.indicators.instances.is_empty() {
+            scrollable(container(editor).padding(iced::Padding {
+                right: 18.0,
+                ..Default::default()
+            }))
+            .id(scrollable::Id::new(SOURCE_EDITOR_ID))
+            .height(Length::Fill)
+            .into()
+        } else if side_by_side {
             row![
                 column![
                     text("Instances · select to edit").size(14),
@@ -1116,7 +1370,7 @@ impl Manager {
                 .width(220)
                 .height(Length::Fill),
                 scrollable(container(editor).padding(iced::Padding {
-                    right: 14.0,
+                    right: 18.0,
                     ..Default::default()
                 }))
                 .id(scrollable::Id::new(SOURCE_EDITOR_ID))
@@ -1129,7 +1383,7 @@ impl Manager {
         } else {
             column![
                 scrollable(container(editor).padding(iced::Padding {
-                    right: 14.0,
+                    right: 18.0,
                     ..Default::default()
                 }))
                 .id(scrollable::Id::new(SOURCE_EDITOR_ID))
@@ -1143,8 +1397,7 @@ impl Manager {
             .height(Length::Fill)
             .into()
         };
-        container(column![header, middle, footer].spacing(10))
-            .padding(10)
+        container(column![header, middle, footer].spacing(8))
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -1172,6 +1425,69 @@ mod tests {
         let (action, _) = manager.update(Event::Remove, &chart);
         chart.dispatch(action.unwrap());
         assert!(chart.indicators.instances.is_empty());
+    }
+
+    #[test]
+    fn vwap_session_edits_preserve_instances_and_reject_invalid_times() {
+        let mut chart = ChartState::default();
+        let mut manager = Manager::default();
+        manager.load(IndicatorKind::Vwap.default_spec());
+        chart.dispatch(manager.update(Event::Submit, &chart).0.unwrap());
+        let _ = manager.applied(&chart);
+        let day = chart.indicators.instances[0].id;
+        let _ = manager.update(Event::New, &chart);
+        let _ = manager.update(Event::VwapPeriod(VwapPeriod::Week), &chart);
+        chart.dispatch(manager.update(Event::Submit, &chart).0.unwrap());
+        let _ = manager.applied(&chart);
+        let week = chart.indicators.instances[1].id;
+        let _ = manager.update(Event::Select(day), &chart);
+        let _ = manager.update(Event::VwapPeriod(VwapPeriod::ALL[3]), &chart);
+        for (index, value) in ["America/New_York", "09:30", "16:00"]
+            .into_iter()
+            .enumerate()
+        {
+            let _ = manager.update(Event::Field(index, value.into()), &chart);
+        }
+        chart.dispatch(manager.update(Event::Submit, &chart).0.unwrap());
+        let _ = manager.applied(&chart);
+        let custom = IndicatorSpec::Vwap {
+            reset: VwapPeriod::custom("America/New_York", "09:30", "16:00").unwrap(),
+        };
+        assert_eq!(
+            chart
+                .indicators
+                .instances
+                .iter()
+                .find(|item| item.id == day)
+                .unwrap()
+                .spec,
+            custom
+        );
+        assert_eq!(
+            chart
+                .indicators
+                .instances
+                .iter()
+                .find(|item| item.id == week)
+                .unwrap()
+                .spec,
+            IndicatorSpec::Vwap {
+                reset: VwapPeriod::Week
+            }
+        );
+        let _ = manager.update(Event::Field(2, "25:00".into()), &chart);
+        assert!(manager.update(Event::Submit, &chart).0.is_none());
+        assert_eq!(
+            chart
+                .indicators
+                .instances
+                .iter()
+                .find(|item| item.id == day)
+                .unwrap()
+                .spec,
+            custom
+        );
+        assert_eq!(chart.indicators.instances.len(), 2);
     }
 
     use super::*;
@@ -1229,6 +1545,40 @@ mod tests {
             },
         );
         assert_eq!(chart.indicators.instances[1].source, native_source);
+    }
+
+    #[test]
+    fn profile_shortcuts_preserve_parameter_paste() {
+        let manager = Manager::default();
+        let chart = ChartState::default();
+        assert!(matches!(
+            manager.key(
+                keyboard::Key::Character("t"),
+                keyboard::Modifiers::CTRL,
+                true,
+                &chart
+            ),
+            Some(Event::Profile(ProfileEntry::Tpo))
+        ));
+        assert!(matches!(
+            manager.key(
+                keyboard::Key::Character("v"),
+                keyboard::Modifiers::CTRL,
+                false,
+                &chart
+            ),
+            Some(Event::Profile(ProfileEntry::VisibleVolume))
+        ));
+        assert!(
+            manager
+                .key(
+                    keyboard::Key::Character("v"),
+                    keyboard::Modifiers::CTRL,
+                    true,
+                    &chart
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -1326,6 +1676,7 @@ mod tests {
                 quote_coin: mexc_model::Quote::USD,
                 settle_coin: underlying.into(),
                 price_scale: 2,
+                tick_size: None,
                 contract_size: 1.0,
                 inverse: matches!(exchange, Exchange::Binance | Exchange::Okx),
                 volume_unit: "contracts".into(),

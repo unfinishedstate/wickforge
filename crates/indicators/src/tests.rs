@@ -2,6 +2,530 @@ use super::*;
 use mexc_model::VolumeFlow;
 
 #[test]
+fn vwap_preserves_extreme_weighted_products_without_intermediate_underflow() {
+    let bars = vec![vwap_bar(0, 1e-300, 1e300), vwap_bar(300, 1e300, 1e-300)];
+    let mut state = VwapState::default();
+    let mut points = Vec::new();
+    state.update(
+        &bars,
+        &mut points,
+        0,
+        Timeframe::Min5,
+        VwapReset::Anchored { start_ms: 0 },
+    );
+    let result = points[1].values[0].unwrap();
+    assert!(result.is_finite() && (result / 2e-300 - 1.0).abs() < 1e-12);
+    let mut bar = vwap_bar(0, 3e-300, 1.0);
+    bar.low = -f64::MAX;
+    bar.high = f64::MAX;
+    state.update(
+        &[bar],
+        &mut points,
+        0,
+        Timeframe::Min5,
+        VwapReset::Anchored { start_ms: 0 },
+    );
+    let result = points[0].values[0].unwrap();
+    assert!((result / 1e-300 - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn vwap_truncation_empty_history_and_timeframe_changes_do_not_reuse_stale_context() {
+    let bars = vec![vwap_bar(0, 10.0, 1.0), vwap_bar(300, 30.0, 1.0)];
+    let mut state = VwapState::default();
+    let mut points = Vec::new();
+    let reset = VwapReset::Session(profiles::Period::Day);
+    state.update(&bars, &mut points, 0, Timeframe::Min5, reset);
+    assert!(state.context(1).unwrap().covered);
+    state.update(&bars, &mut points, 2, Timeframe::Min1, reset);
+    assert!(!state.context(1).unwrap().covered);
+    state.update(&bars[..1], &mut points, 1, Timeframe::Min1, reset);
+    assert_eq!(points.len(), 1);
+    assert!(state.context(1).is_none());
+    state.update(&[], &mut points, 1, Timeframe::Min1, reset);
+    assert!(points.is_empty());
+    assert!(state.context(0).is_none());
+}
+
+fn vwap_bar(time: i64, price: f64, volume: f64) -> Candle {
+    Candle {
+        time,
+        open: price,
+        high: price,
+        low: price,
+        close: price,
+        volume,
+        flow: None,
+    }
+}
+
+fn vwap_ms(timestamp: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .unwrap()
+        .timestamp_millis()
+}
+
+#[test]
+fn vwap_weights_native_hlc3_and_integrates_as_a_native_overlay() {
+    let mut bars = vec![vwap_bar(0, 10.0, 2.0), vwap_bar(300, 20.0, 1.0)];
+    bars[0].high = 14.0;
+    bars[0].low = 6.0;
+    bars[0].close = 13.0; // HLC3 = 11, not the close or OHLC4.
+    let spec = IndicatorKind::Vwap.default_spec();
+    assert_eq!(
+        spec,
+        IndicatorSpec::Vwap {
+            reset: profiles::Period::Day
+        }
+    );
+    assert!(spec.is_overlay());
+    assert_eq!(spec.series_names(), &["VWAP"]);
+    let mut set = IndicatorSet::default();
+    set.add(spec, &bars, Timeframe::Min5).unwrap();
+    series(&set.instances[0].points, 0, &[Some(11.0), Some(14.0)]);
+    assert_eq!(
+        set.instances[0].vwap_context(1),
+        Some(VwapContext {
+            origin_ms: 0,
+            covered: true
+        })
+    );
+    assert!(
+        validate_source(
+            &IndicatorSource {
+                mode: SourceMode::All,
+                markets: Vec::new()
+            },
+            spec
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn vwap_zero_and_invalid_bars_never_manufacture_values_or_coverage() {
+    let mut bars = vec![
+        vwap_bar(0, 8.0, 0.0),
+        vwap_bar(300, 10.0, 2.0),
+        vwap_bar(600, 999.0, 0.0),
+        vwap_bar(900, 20.0, -1.0),
+        vwap_bar(1200, 20.0, 2.0),
+        vwap_bar(1500, 20.0, f64::NAN),
+        vwap_bar(1800, 20.0, 1.0),
+        vwap_bar(2100, 20.0, f64::INFINITY),
+        vwap_bar(2400, 20.0, 1.0),
+        vwap_bar(2700, 20.0, 1.0),
+    ];
+    bars[6].high = f64::INFINITY;
+    bars[8].close = f64::NAN;
+    bars[9].low = 21.0;
+    let mut state = VwapState::default();
+    let mut points = Vec::new();
+    state.update(
+        &bars,
+        &mut points,
+        0,
+        Timeframe::Min5,
+        VwapReset::Session(profiles::Period::Day),
+    );
+    series(
+        &points,
+        0,
+        &[
+            None,
+            Some(10.0),
+            Some(10.0),
+            None,
+            Some(15.0),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ],
+    );
+    assert!(state.context(0).unwrap().covered); // zero is valid native volume
+    assert!(state.context(2).unwrap().covered);
+    assert!(!state.context(3).unwrap().covered);
+    assert!(!state.context(4).unwrap().covered);
+}
+
+#[test]
+fn vwap_calendar_resets_follow_utc_bounds_not_the_chart_timeframe() {
+    for (period, boundary) in [
+        (profiles::Period::Day, "2024-01-02T00:00:00Z"),
+        (profiles::Period::Week, "2024-01-08T00:00:00Z"),
+        (profiles::Period::Month, "2024-02-01T00:00:00Z"),
+    ] {
+        let boundary = vwap_ms(boundary);
+        let bars = vec![
+            vwap_bar(boundary / 1000 - 300, 10.0, 3.0),
+            vwap_bar(boundary / 1000, 30.0, 1.0),
+            vwap_bar(boundary / 1000 + 300, 50.0, 1.0),
+        ];
+        let mut state = VwapState::default();
+        let mut points = Vec::new();
+        state.update(
+            &bars,
+            &mut points,
+            0,
+            Timeframe::Min5,
+            VwapReset::Session(period),
+        );
+        series(&points, 0, &[Some(10.0), Some(30.0), Some(40.0)]);
+        assert!(!state.context(0).unwrap().covered);
+        assert_eq!(
+            state.context(1),
+            Some(VwapContext {
+                origin_ms: boundary,
+                covered: true
+            })
+        );
+        assert!(state.context(2).unwrap().covered);
+    }
+    let origin = vwap_ms("2024-02-01T00:00:00Z");
+    let bars = vec![
+        vwap_bar(origin / 1000, 10.0, 1.0),
+        vwap_bar(origin / 1000 + 86400, 30.0, 1.0),
+    ];
+    let mut state = VwapState::default();
+    let mut points = Vec::new();
+    state.update(
+        &bars,
+        &mut points,
+        0,
+        Timeframe::Day1,
+        VwapReset::Session(profiles::Period::Month),
+    );
+    series(&points, 0, &[Some(10.0), Some(20.0)]);
+    assert!(state.context(1).unwrap().covered);
+}
+
+#[test]
+fn vwap_partial_origins_gaps_and_new_sessions_report_honest_coverage() {
+    let bars = vec![
+        vwap_bar(300, 10.0, 1.0),
+        vwap_bar(600, 20.0, 1.0),
+        vwap_bar(1200, 30.0, 1.0),
+        vwap_bar(86400, 40.0, 1.0),
+    ];
+    let mut state = VwapState::default();
+    let mut points = Vec::new();
+    state.update(
+        &bars,
+        &mut points,
+        0,
+        Timeframe::Min5,
+        VwapReset::Session(profiles::Period::Day),
+    );
+    series(
+        &points,
+        0,
+        &[Some(10.0), Some(15.0), Some(20.0), Some(40.0)],
+    );
+    for i in 0..3 {
+        assert_eq!(
+            state.context(i),
+            Some(VwapContext {
+                origin_ms: 0,
+                covered: false
+            })
+        );
+    }
+    assert_eq!(
+        state.context(3),
+        Some(VwapContext {
+            origin_ms: 86_400_000,
+            covered: true
+        })
+    );
+    let mut with_origin = vec![vwap_bar(0, 1.0, 1.0)];
+    with_origin.extend_from_slice(&bars[..3]);
+    state.update(
+        &with_origin,
+        &mut points,
+        3,
+        Timeframe::Min5,
+        VwapReset::Session(profiles::Period::Day),
+    );
+    assert!(state.context(2).unwrap().covered); // changed first candle forces reseed
+    assert!(!state.context(3).unwrap().covered); // native 900-second candle is absent
+}
+
+#[test]
+fn vwap_custom_gaps_overnight_and_straddling_candles_are_not_invented() {
+    let reset = VwapReset::Session(profiles::Period::custom("UTC", "09:30", "10:00").unwrap());
+    let bars = vec![
+        vwap_bar(9 * 3600, 10.0, 1.0),  // straddles open on an hourly chart
+        vwap_bar(10 * 3600, 20.0, 1.0), // outside session
+    ];
+    let mut state = VwapState::default();
+    let mut points = Vec::new();
+    state.update(&bars, &mut points, 0, Timeframe::Min60, reset);
+    series(&points, 0, &[None, None]);
+    assert!(state.context(0).is_none());
+    let bars = vec![vwap_bar(9 * 3600 + 1800, 10.0, 1.0)];
+    state.update(&bars, &mut points, 0, Timeframe::Min60, reset);
+    assert_eq!(points[0].values[0], None); // straddles close
+    assert!(!state.context(0).unwrap().covered);
+    let reset = VwapReset::Session(profiles::Period::custom("UTC", "22:00", "02:00").unwrap());
+    let bars = vec![
+        vwap_bar(22 * 3600, 10.0, 1.0),
+        vwap_bar(23 * 3600, 20.0, 1.0),
+        vwap_bar(24 * 3600, 30.0, 1.0),
+        vwap_bar(25 * 3600, 40.0, 1.0),
+        vwap_bar(26 * 3600, 50.0, 1.0),
+        vwap_bar(46 * 3600, 60.0, 1.0),
+    ];
+    state.update(&bars, &mut points, 0, Timeframe::Min60, reset);
+    series(
+        &points,
+        0,
+        &[
+            Some(10.0),
+            Some(15.0),
+            Some(20.0),
+            Some(25.0),
+            None,
+            Some(60.0),
+        ],
+    );
+    assert!(state.context(3).unwrap().covered);
+    assert!(state.context(4).is_none());
+    assert!(state.context(5).unwrap().covered);
+}
+
+#[test]
+fn vwap_custom_iana_sessions_share_spring_and_fall_dst_calendar_rules() {
+    for (date, open, last, duration_hours) in [
+        (
+            "2024-03-10",
+            "2024-03-10T05:00:00Z",
+            "2024-03-11T03:00:00Z",
+            23,
+        ),
+        (
+            "2024-11-03",
+            "2024-11-03T04:00:00Z",
+            "2024-11-04T04:00:00Z",
+            25,
+        ),
+    ] {
+        let period = profiles::Period::custom("America/New_York", "00:00", "00:00").unwrap();
+        let open = vwap_ms(open);
+        let bounds = profiles::period_bounds(period, open);
+        assert_eq!(bounds, (open, open + duration_hours * 3_600_000), "{date}");
+        let bars: Vec<_> = (0..duration_hours)
+            .map(|i| vwap_bar(open / 1000 + i * 3600, (i + 1) as f64, 1.0))
+            .collect();
+        let mut state = VwapState::default();
+        let mut points = Vec::new();
+        state.update(
+            &bars,
+            &mut points,
+            0,
+            Timeframe::Min60,
+            VwapReset::Session(period),
+        );
+        assert_eq!(points.last().unwrap().time * 1000, vwap_ms(last));
+        close(
+            points.last().unwrap().values[0],
+            Some((duration_hours + 1) as f64 / 2.0),
+        );
+        assert!(state.context(bars.len() - 1).unwrap().covered);
+    }
+    let period = profiles::Period::custom("America/New_York", "02:30", "04:00").unwrap();
+    let origin = vwap_ms("2024-03-10T07:00:00Z"); // missing 02:30 advances to 03:00
+    let mut state = VwapState::default();
+    let mut points = Vec::new();
+    state.update(
+        &[vwap_bar(origin / 1000, 7.0, 1.0)],
+        &mut points,
+        0,
+        Timeframe::Min60,
+        VwapReset::Session(period),
+    );
+    assert_eq!(
+        state.context(0),
+        Some(VwapContext {
+            origin_ms: origin,
+            covered: true
+        })
+    );
+}
+
+#[test]
+fn vwap_incremental_replacements_corrections_appends_and_prepends_match_reseed() {
+    let reset = VwapReset::Session(profiles::Period::Day);
+    let mut bars: Vec<_> = (0..20)
+        .map(|i| vwap_bar(i * 300, i as f64 + 2.0, i as f64 + 1.0))
+        .collect();
+    let mut state = VwapState::default();
+    let mut points = Vec::new();
+    state.update(&bars, &mut points, 0, Timeframe::Min5, reset);
+    for from in [19, 19, 8, 0] {
+        bars[from] = vwap_bar(bars[from].time, 35.0 + from as f64, 7.0);
+        state.update(&bars, &mut points, from, Timeframe::Min5, reset);
+        let mut rebuilt = Vec::new();
+        let mut fresh = VwapState::default();
+        fresh.update(&bars, &mut rebuilt, 0, Timeframe::Min5, reset);
+        assert_eq!(points, rebuilt);
+        for i in 0..bars.len() {
+            assert_eq!(state.context(i), fresh.context(i));
+        }
+    }
+    bars.push(vwap_bar(6000, 123.0, 4.0));
+    state.update(&bars, &mut points, 20, Timeframe::Min5, reset);
+    let mut rebuilt = Vec::new();
+    VwapState::default().update(&bars, &mut rebuilt, 0, Timeframe::Min5, reset);
+    assert_eq!(points, rebuilt);
+    bars.insert(0, vwap_bar(-300, 8.0, 2.0));
+    state.update(&bars, &mut points, 0, Timeframe::Min5, reset);
+    VwapState::default().update(&bars, &mut rebuilt, 0, Timeframe::Min5, reset);
+    assert_eq!(points, rebuilt);
+    bars.reverse();
+    state.update(&bars, &mut points, 20, Timeframe::Min5, reset);
+    VwapState::default().update(&bars, &mut rebuilt, 0, Timeframe::Min5, reset);
+    assert_eq!(points, rebuilt);
+    assert!(points.iter().skip(1).all(|point| point.values[0].is_none()));
+}
+
+#[test]
+fn vwap_anchored_exact_midbar_absent_and_future_origins_are_explicit() {
+    let bars = vec![
+        vwap_bar(0, 10.0, 1.0),
+        vwap_bar(300, 20.0, 3.0),
+        vwap_bar(600, 40.0, 1.0),
+    ];
+    let mut state = VwapState::default();
+    let mut points = Vec::new();
+    state.update(
+        &bars,
+        &mut points,
+        0,
+        Timeframe::Min5,
+        VwapReset::Anchored { start_ms: 300_000 },
+    );
+    series(&points, 0, &[None, Some(20.0), Some(25.0)]);
+    assert!(state.context(0).is_none());
+    assert_eq!(
+        state.context(2),
+        Some(VwapContext {
+            origin_ms: 300_000,
+            covered: true
+        })
+    );
+    state.update(
+        &bars,
+        &mut points,
+        2,
+        Timeframe::Min5,
+        VwapReset::Anchored { start_ms: 150_000 },
+    );
+    series(&points, 0, &[None, Some(20.0), Some(25.0)]);
+    assert_eq!(
+        state.context(1),
+        Some(VwapContext {
+            origin_ms: 150_000,
+            covered: false
+        })
+    );
+    state.update(
+        &bars[1..],
+        &mut points,
+        2,
+        Timeframe::Min5,
+        VwapReset::Anchored { start_ms: 0 },
+    );
+    series(&points, 0, &[Some(20.0), Some(25.0)]);
+    assert_eq!(
+        state.context(0),
+        Some(VwapContext {
+            origin_ms: 0,
+            covered: false
+        })
+    );
+    state.update(
+        &bars,
+        &mut points,
+        0,
+        Timeframe::Min5,
+        VwapReset::Anchored { start_ms: 900_000 },
+    );
+    assert!(points.iter().all(|point| point.values[0].is_none()));
+    assert!((0..bars.len()).all(|i| state.context(i).is_none()));
+}
+
+#[test]
+fn vwap_extreme_finite_prices_and_weights_remain_bounded_and_never_nan() {
+    let reset = VwapReset::Anchored { start_ms: 0 };
+    let mut state = VwapState::default();
+    let mut points = Vec::new();
+    let bars = vec![
+        vwap_bar(0, f64::MAX, f64::MAX),
+        vwap_bar(300, f64::MAX, f64::MAX),
+        vwap_bar(600, -f64::MAX, f64::MAX),
+        vwap_bar(900, 0.0, f64::MAX),
+    ];
+    state.update(&bars, &mut points, 0, Timeframe::Min5, reset);
+    close(points[0].values[0], Some(f64::MAX));
+    close(points[1].values[0], Some(f64::MAX));
+    close(points[2].values[0], Some(f64::MAX / 3.0));
+    close(points[3].values[0], Some(f64::MAX / 4.0));
+    assert!(
+        points
+            .iter()
+            .all(|point| point.values[0].unwrap().is_finite())
+    );
+    let bars = vec![
+        vwap_bar(0, 3.0, f64::from_bits(1)),
+        vwap_bar(300, 9.0, f64::from_bits(1)),
+    ];
+    state.update(&bars, &mut points, 0, Timeframe::Min5, reset);
+    series(&points, 0, &[Some(3.0), Some(6.0)]);
+    state.update(
+        &[vwap_bar(i64::MAX, 3.0, 1.0)],
+        &mut points,
+        0,
+        Timeframe::Min5,
+        reset,
+    );
+    assert_eq!(points[0].values[0], None);
+    assert!(state.context(0).is_none());
+}
+
+#[test]
+fn vwap_public_reset_validation_and_custom_labels_are_safe() {
+    for start_ms in [i64::MIN, i64::MAX] {
+        assert!(VwapReset::Anchored { start_ms }.validate().is_err());
+    }
+    for (start_minute, end_minute) in [(1440, 0), (0, 1440), (u16::MAX, u16::MAX)] {
+        let reset = profiles::Period::Custom {
+            timezone: chrono_tz::UTC,
+            start_minute,
+            end_minute,
+        };
+        assert!(VwapReset::Session(reset).validate().is_err());
+        assert!(IndicatorSpec::Vwap { reset }.validate().is_err());
+        let mut points = Vec::new();
+        VwapState::default().update(
+            &[vwap_bar(0, 1.0, 1.0)],
+            &mut points,
+            0,
+            Timeframe::Min5,
+            VwapReset::Session(reset),
+        );
+        assert_eq!(points[0].values[0], None);
+    }
+    let period = profiles::Period::custom("America/New_York", "09:30", "16:00").unwrap();
+    assert!(
+        IndicatorSpec::Vwap { reset: period }
+            .label()
+            .contains("America/New_York 09:30–16:00")
+    );
+}
+
+#[test]
 fn native_open_interest_never_allocates_candle_aligned_outputs_across_configuration() {
     let bars = candles(&[10.0, 20.0, 30.0]);
     let mut set = IndicatorSet::default();

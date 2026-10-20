@@ -14,12 +14,12 @@ pub struct Palette {
 impl Default for Palette {
     fn default() -> Self {
         Self {
-            background: Color::from_rgb8(16, 19, 21),
-            foreground: Color::from_rgb8(202, 204, 204),
-            red: Color::from_rgb8(86, 93, 96),
-            green: Color::from_rgb8(159, 165, 169),
-            accent: Color::from_rgb8(121, 129, 134),
-            muted: Color::from_rgb8(75, 78, 85),
+            background: Color::from_rgb8(17, 24, 39),
+            foreground: Color::from_rgb8(229, 231, 235),
+            red: Color::from_rgb8(248, 113, 113),
+            green: Color::from_rgb8(52, 211, 153),
+            accent: Color::from_rgb8(96, 165, 250),
+            muted: Color::from_rgb8(148, 163, 184),
         }
         .legible()
     }
@@ -81,7 +81,7 @@ impl Palette {
 
     pub fn theme(self) -> Theme {
         Theme::custom(
-            "Omarchy".into(),
+            "mexc-chart".into(),
             theme::Palette {
                 background: self.background,
                 text: self.foreground,
@@ -146,27 +146,44 @@ pub struct ThemeFile {
     contents: Option<String>,
     paths: Vec<PathBuf>,
     selected: Option<PathBuf>,
+    explicit: bool,
 }
 
 impl ThemeFile {
     pub fn new() -> Self {
-        let paths = if let Some(path) = std::env::var_os("MEXC_CHART_THEME") {
-            vec![PathBuf::from(path)]
-        } else {
-            let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-            let state = std::env::var_os("XDG_STATE_HOME")
-                .filter(|value| !value.is_empty())
+        let override_path = std::env::var_os("MEXC_CHART_THEME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let explicit = override_path.is_some();
+        let paths = override_path.map_or_else(Self::omarchy_paths, |path| vec![path]);
+        Self::from_paths(paths, explicit)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn omarchy_paths() -> Vec<PathBuf> {
+        let home = std::env::home_dir().filter(|path| path.is_absolute());
+        let directory = |variable: &str, suffix: &str| {
+            std::env::var_os(variable)
                 .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".local/state"));
-            let config = std::env::var_os("XDG_CONFIG_HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".config"));
-            vec![
-                state.join("omarchy/current/theme/colors.toml"),
-                config.join("omarchy/current/theme/colors.toml"),
-            ]
+                .filter(|path| path.is_absolute())
+                .or_else(|| home.as_ref().map(|home| home.join(suffix)))
         };
+        [
+            directory("XDG_STATE_HOME", ".local/state"),
+            directory("XDG_CONFIG_HOME", ".config"),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|root| root.join("omarchy/current/theme/colors.toml"))
+        .collect()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn omarchy_paths() -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    fn from_paths(paths: Vec<PathBuf>, explicit: bool) -> Self {
         let palette = Palette::default();
         let mut file = Self {
             palette,
@@ -175,6 +192,7 @@ impl ThemeFile {
             contents: None,
             paths,
             selected: None,
+            explicit,
         };
         file.reload();
         file
@@ -182,20 +200,19 @@ impl ThemeFile {
 
     /// Retains the last valid palette throughout atomic replacement or malformed edits.
     pub fn reload(&mut self) -> bool {
-        let mut failure = String::new();
+        let mut failure = None;
         for path in &self.paths {
             let contents = match std::fs::read_to_string(path) {
                 Ok(contents) => contents,
                 Err(error) => {
-                    failure = format!("Theme {}: {error}", path.display());
-                    // An existing primary palette is never replaced by a fallback
-                    // merely because its contents temporarily became unreadable.
-                    if error.kind() != std::io::ErrorKind::NotFound
-                        || self.selected.as_ref() == Some(path)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && !self.explicit
+                        && self.selected.as_ref() != Some(path)
                     {
-                        break;
+                        continue;
                     }
-                    continue;
+                    failure = Some(format!("Theme {}: {error}", path.display()));
+                    break;
                 }
             };
             if self.contents.as_ref() == Some(&contents) {
@@ -218,12 +235,12 @@ impl ThemeFile {
                     return changed;
                 }
                 Err(error) => {
-                    failure = format!("Theme {}: {error}", path.display());
+                    failure = Some(format!("Theme {}: {error}", path.display()));
                     break;
                 }
             }
         }
-        self.error = Some(failure);
+        self.error = failure;
         false
     }
 }
@@ -231,13 +248,89 @@ impl ThemeFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const DARK: &str = "background='#000000'\nforeground='#ffffff'\nred='#ff5555'\ngreen='#55ff55'\naccent='#7799ff'\nmuted='#aaaaaa'";
+    const LIGHT: &str = "background='#ffffff'\nforeground='#000000'\nred='#990000'\ngreen='#005500'\naccent='#000099'\nmuted='#555555'";
+
+    struct ThemeDirectory(PathBuf);
+
+    impl ThemeDirectory {
+        fn new() -> Self {
+            static UNIQUE: AtomicU64 = AtomicU64::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mexc-chart-theme-{}-{nanos}-{}",
+                std::process::id(),
+                UNIQUE.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ThemeDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
-    fn aliases_and_invalid_replacement() {
-        let valid = "bg = '#101315'\nfg = '#cacccc'\ncolor1 = '#ff0000'\ncolor2 = '#00ff00'\ncolor4 = '#0000ff'";
-        assert_eq!(
-            Palette::parse(valid).unwrap().background,
-            Palette::default().background
-        );
+    fn optional_theme_can_appear_after_a_clean_standalone_start() {
+        let directory = ThemeDirectory::new();
+        let path = directory.0.join("colors.toml");
+        let mut file = ThemeFile::from_paths(vec![path.clone()], false);
+        assert!(file.error.is_none());
+        std::fs::write(&path, LIGHT).unwrap();
+        assert!(file.reload());
+        assert_eq!(file.palette, Palette::parse(LIGHT).unwrap());
+        assert!(file.error.is_none());
+    }
+
+    #[test]
+    fn explicitly_missing_theme_reports_failure_and_recovers_when_created() {
+        let directory = ThemeDirectory::new();
+        let path = directory.0.join("colors.toml");
+        let mut file = ThemeFile::from_paths(vec![path.clone()], true);
+        assert!(file.error.is_some());
+        std::fs::write(&path, DARK).unwrap();
+        assert!(file.reload());
+        assert!(file.error.is_none());
+    }
+
+    #[test]
+    fn broken_or_missing_selected_theme_retains_last_good_colors_until_repaired() {
+        let directory = ThemeDirectory::new();
+        let primary = directory.0.join("primary.toml");
+        let fallback = directory.0.join("fallback.toml");
+        std::fs::write(&fallback, DARK).unwrap();
+        let mut file = ThemeFile::from_paths(vec![primary.clone(), fallback], false);
+        let dark = file.palette;
+        assert!(file.error.is_none());
+        std::fs::write(&primary, "background = 'broken'").unwrap();
+        assert!(!file.reload());
+        assert_eq!(file.palette, dark);
+        assert!(file.error.is_some());
+        std::fs::write(&primary, LIGHT).unwrap();
+        assert!(file.reload());
+        let light = file.palette;
+        assert_ne!(light, dark);
+        assert!(file.error.is_none());
+        std::fs::remove_file(&primary).unwrap();
+        assert!(!file.reload());
+        assert_eq!(file.palette, light);
+        assert!(file.error.is_some());
+        std::fs::write(&primary, DARK).unwrap();
+        assert!(file.reload());
+        assert_eq!(file.palette, dark);
+        assert!(file.error.is_none());
+    }
+
+    #[test]
+    fn invalid_theme_is_rejected() {
         assert!(Palette::parse("background = 'broken'").is_err());
     }
 

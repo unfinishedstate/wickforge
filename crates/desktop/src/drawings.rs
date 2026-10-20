@@ -1,16 +1,66 @@
 use crate::drawing_types::{
     Anchor, Anchors, Command, Drawing, DrawingId, FIB_LEVELS, InstrumentKey, Shape, Style, Tool,
 };
+use crate::workspace::{SavedBook, SavedDrawing, SavedInstrument};
 use chrono::{DateTime, Utc};
-use mexc_model::Market;
+use mexc_indicators::{IndicatorPoint, VwapContext, VwapReset, VwapState};
+use mexc_model::{Candle, Exchange, Market, Product, Timeframe};
 use std::collections::HashMap;
 
-/// Session-owned books use native instrument identity, never the displayed timeframe.
+/// Instrument-owned committed books; native identity excludes the displayed timeframe.
 pub struct Store {
     books: HashMap<InstrumentKey, Book>,
     key: InstrumentKey,
     generation: u64,
     next_id: DrawingId,
+    vwap: HashMap<DrawingId, AnchoredVwap>,
+    vwap_revision: u64,
+    vwap_context: Option<(u64, Timeframe)>,
+    vwap_book_revision: Option<u64>,
+    vwap_preview: Option<(DrawingId, i64)>,
+}
+
+/// Derived native-candle values are not durable drawing geometry or undo payloads.
+#[derive(Debug, Default)]
+pub struct AnchoredVwap {
+    start_ms: i64,
+    state: VwapState,
+    pub points: Vec<IndicatorPoint>,
+    pub step_ms: i64,
+    first_value: Option<usize>,
+    start: Option<Anchor>,
+    covered: bool,
+}
+
+impl AnchoredVwap {
+    pub fn context(&self, index: usize) -> Option<VwapContext> {
+        self.state.context(index)
+    }
+
+    pub fn start(&self) -> Option<Anchor> {
+        self.start
+    }
+
+    pub fn label(&self) -> &'static str {
+        if self.start.is_none() {
+            "Anchored VWAP · unavailable"
+        } else if self.covered {
+            "Anchored VWAP · candle HLC3"
+        } else {
+            "Anchored VWAP · partial"
+        }
+    }
+
+    pub fn status(&self) -> &'static str {
+        if self.start.is_none() {
+            return "unavailable · no loaded positive-volume candle at/after start";
+        }
+        if self.covered {
+            "native HLC3 × volume · candle approximation"
+        } else {
+            "partial history / boundary · native HLC3 × volume approximation"
+        }
+    }
 }
 
 #[derive(Default)]
@@ -29,6 +79,7 @@ enum Delta {
     Remove { index: usize },
     Replace { index: usize, drawing: Drawing },
     Move { index: usize, anchors: Anchors },
+    Style { index: usize, style: Style },
     Visible { index: usize, visible: bool },
     Locked { index: usize, locked: bool },
 }
@@ -56,6 +107,10 @@ impl Delta {
                     anchors: previous,
                 }
             }
+            Self::Style { index, style } => Self::Style {
+                index,
+                style: std::mem::replace(&mut objects[index].style, style),
+            },
             Self::Visible { index, visible } => Self::Visible {
                 index,
                 visible: std::mem::replace(&mut objects[index].visible, visible),
@@ -113,6 +168,83 @@ impl Book {
 }
 
 impl Store {
+    /// Count all committed objects, including hidden/locked objects in inactive books.
+    pub fn total_objects(&self) -> usize {
+        self.books.values().map(|book| book.objects.len()).sum()
+    }
+
+    /// Only committed objects are durable, including hidden and locked objects.
+    pub fn workspace_books(&self) -> Vec<SavedBook> {
+        let mut books: Vec<_> = self
+            .books
+            .iter()
+            .filter(|(_, book)| !book.objects.is_empty())
+            .map(|(key, book)| SavedBook {
+                instrument: SavedInstrument::from(key),
+                drawings: book.objects.iter().map(SavedDrawing::from).collect(),
+            })
+            .collect();
+        // Hash-map iteration order must not make an unchanged workspace dirty.
+        books.sort_by(|a, b| {
+            let a = &a.instrument;
+            let b = &b.instrument;
+            (
+                Exchange::from(a.exchange).index(),
+                Product::from(a.product).index(),
+                &a.symbol,
+            )
+                .cmp(&(
+                    Exchange::from(b.exchange).index(),
+                    Product::from(b.product).index(),
+                    &b.symbol,
+                ))
+        });
+        books
+    }
+
+    /// Build a complete fresh store before cutover; no inverse delta is restored.
+    pub fn restore_workspace(
+        &mut self,
+        market: &Market,
+        saved: &[SavedBook],
+    ) -> Result<(), String> {
+        crate::workspace::validate_symbol(&market.symbol)?;
+        let mut books = HashMap::with_capacity(saved.len() + 1);
+        let mut ids = std::collections::HashSet::new();
+        let mut max_id = 0;
+        for book in saved {
+            let key = book.instrument.to_key()?;
+            if books.contains_key(&key) {
+                return Err("Duplicate instrument drawing book".into());
+            }
+            let mut objects = Vec::with_capacity(book.drawings.len());
+            for drawing in &book.drawings {
+                if !ids.insert(drawing.id) {
+                    return Err("Duplicate drawing ID across workspace".into());
+                }
+                objects.push(drawing.to_drawing()?);
+                max_id = max_id.max(drawing.id);
+            }
+            books.insert(
+                key,
+                Book {
+                    objects,
+                    ..Book::default()
+                },
+            );
+        }
+        let next_id = max_id
+            .checked_add(1)
+            .ok_or("Drawing IDs have been exhausted")?;
+        let key = InstrumentKey::from(market);
+        books.entry(key.clone()).or_default();
+        self.books = books;
+        self.key = key;
+        self.next_id = next_id;
+        self.generation = self.generation.wrapping_add(1);
+        Ok(())
+    }
+
     pub fn new(market: &Market) -> Self {
         let key = InstrumentKey::from(market);
         let mut books = HashMap::new();
@@ -121,6 +253,11 @@ impl Store {
             books,
             key,
             generation: 0,
+            vwap: HashMap::new(),
+            vwap_revision: 0,
+            vwap_context: None,
+            vwap_book_revision: None,
+            vwap_preview: None,
             next_id: 1,
         }
     }
@@ -177,11 +314,116 @@ impl Store {
         !self.book().redo.is_empty()
     }
 
+    pub fn vwap(&self, id: DrawingId) -> Option<&AnchoredVwap> {
+        self.vwap.get(&id)
+    }
+
+    pub fn vwap_revision(&self) -> u64 {
+        self.vwap_revision
+    }
+
+    /// Synchronize native source/anchor previews after updates, never during paint or hit testing.
+    pub fn sync_vwap_preview(
+        &mut self,
+        candles: &[Candle],
+        timeframe: Timeframe,
+        dirty_from: Option<usize>,
+        preview: Option<(DrawingId, i64)>,
+    ) {
+        let context = (self.generation, timeframe);
+        let reset = self.vwap_context != Some(context);
+        let revision = self.revision();
+        let book_changed = self.vwap_book_revision != Some(revision);
+        if !reset
+            && dirty_from.is_none()
+            && self.vwap_book_revision == Some(revision)
+            && self.vwap_preview == preview
+        {
+            return;
+        }
+        self.vwap_book_revision = Some(revision);
+        self.vwap_preview = preview;
+        if reset {
+            self.vwap.clear();
+            self.vwap_context = Some(context);
+        }
+        let mut changed = reset;
+        let objects = &self
+            .books
+            .get(&self.key)
+            .expect("active drawing book")
+            .objects;
+        if book_changed {
+            self.vwap.retain(|id, _| {
+                objects.iter().any(|drawing| {
+                    drawing.id == *id && matches!(drawing.shape, Shape::AnchoredVwap(_))
+                })
+            });
+        }
+        for drawing in objects {
+            let Shape::AnchoredVwap(anchor) = drawing.shape else {
+                continue;
+            };
+            let anchor = Anchor {
+                utc_ms: preview
+                    .filter(|(id, _)| *id == drawing.id)
+                    .map_or(anchor.utc_ms, |(_, start)| start),
+                price: 0.0,
+            };
+            let cache = self.vwap.entry(drawing.id).or_default();
+            let from = if cache.start_ms != anchor.utc_ms || cache.step_ms == 0 {
+                cache.state = VwapState::default();
+                cache.points.clear();
+                cache.start_ms = anchor.utc_ms;
+                cache.first_value = None;
+                cache.start = None;
+                0
+            } else if let Some(from) = dirty_from {
+                from
+            } else {
+                continue;
+            };
+            cache.step_ms = timeframe.seconds().saturating_mul(1000);
+            cache.state.update(
+                candles,
+                &mut cache.points,
+                from,
+                timeframe,
+                VwapReset::Anchored {
+                    start_ms: anchor.utc_ms,
+                },
+            );
+            if cache.first_value.is_none_or(|index| index >= from) {
+                cache.first_value = cache.points[from.min(cache.points.len())..]
+                    .iter()
+                    .position(|point| point.values[0].is_some())
+                    .map(|index| index + from);
+                cache.start = cache.first_value.map(|index| Anchor {
+                    utc_ms: cache.points[index].time.saturating_mul(1000),
+                    price: cache.points[index].values[0].expect("first VWAP value"),
+                });
+            }
+            cache.covered = cache
+                .points
+                .len()
+                .checked_sub(1)
+                .and_then(|index| cache.context(index))
+                .is_some_and(|context| context.covered);
+            changed = true;
+        }
+        if changed {
+            self.vwap_revision = self.vwap_revision.wrapping_add(1);
+        }
+    }
+
     pub fn apply(&mut self, command: Command) -> Result<bool, String> {
         let delta = match command {
             Command::Undo => return Ok(self.book_mut().undo()),
             Command::Redo => return Ok(self.book_mut().redo()),
-            Command::Create { shape, style } => {
+            Command::Create { mut shape, style } => {
+                if let Shape::AnchoredVwap(anchor) = &mut shape {
+                    anchor.price = 0.0;
+                }
                 validate_shape(&shape)?;
                 validate_style(&style)?;
                 let id = self.next_id;
@@ -201,7 +443,10 @@ impl Store {
                 self.book_mut().selected = Some(id);
                 return Ok(true);
             }
-            Command::Replace(drawing) => {
+            Command::Replace(mut drawing) => {
+                if let Shape::AnchoredVwap(anchor) = &mut drawing.shape {
+                    anchor.price = 0.0;
+                }
                 let index = self.book().index(drawing.id)?;
                 validate_shape(&drawing.shape)?;
                 validate_style(&drawing.style)?;
@@ -211,16 +456,36 @@ impl Store {
                         "Unlock the drawing before changing its geometry or content".to_owned()
                     );
                 }
+                if old.locked && old.style != drawing.style {
+                    return Err("Unlock the drawing before changing its style".to_owned());
+                }
                 if old == &drawing {
                     return Ok(false);
                 }
                 Delta::Replace { index, drawing }
             }
-            Command::Move { id, anchors } => {
+            Command::Style { id, style } => {
+                validate_style(&style)?;
+                let index = self.book().index(id)?;
+                let drawing = &self.objects()[index];
+                if drawing.locked {
+                    return Err("Unlock the drawing before changing its style".to_owned());
+                }
+                if drawing.style == style {
+                    return Ok(false);
+                }
+                Delta::Style { index, style }
+            }
+            Command::Move { id, mut anchors } => {
                 let index = self.book().index(id)?;
                 let drawing = &self.objects()[index];
                 if drawing.locked {
                     return Err("Unlock the drawing before moving or resizing it".to_owned());
+                }
+                if matches!(drawing.shape, Shape::AnchoredVwap(_))
+                    && let Anchors::One(anchor) = &mut anchors
+                {
+                    anchor.price = 0.0;
                 }
                 validate_shape_at(&drawing.shape, anchors)?;
                 if drawing.shape.anchors() == anchors {
@@ -284,9 +549,11 @@ pub fn create_shape(tool: Tool, anchors: Anchors, text: Option<String>) -> Resul
     let shape = match (tool, anchors) {
         (Tool::Horizontal, Anchors::One(a)) => Shape::Horizontal(a),
         (Tool::Vertical, Anchors::One(a)) => Shape::Vertical(a),
+        (Tool::AnchoredVwap, Anchors::One(a)) => Shape::AnchoredVwap(Anchor { price: 0.0, ..a }),
         (Tool::Trend, Anchors::Two(a, b)) => Shape::Trend(a, b),
         (Tool::Ray, Anchors::Two(a, b)) => Shape::Ray(a, b),
         (Tool::Rectangle, Anchors::Two(a, b)) => Shape::Rectangle(a, b),
+        (Tool::Measure, Anchors::Two(a, b)) => Shape::Measure(a, b),
         (Tool::Fibonacci, Anchors::Two(a, b)) => Shape::Fibonacci {
             a,
             b,
@@ -317,40 +584,61 @@ fn validate_anchor(anchor: Anchor) -> Result<(), String> {
 
 /// Validate alternate anchors against borrowed payloads, without copying text or levels.
 fn validate_shape_at(shape: &Shape, anchors: Anchors) -> Result<(), String> {
+    let text = match shape {
+        Shape::Text { text, .. } => Some(text.as_str()),
+        _ => None,
+    };
+    let fibonacci = match shape {
+        Shape::Fibonacci {
+            levels, reverse, ..
+        } => Some((levels.as_slice(), *reverse)),
+        _ => None,
+    };
+    validate_shape_parts(shape.tool(), anchors, text, fibonacci)
+}
+
+/// Borrow durable/native payloads through the same geometry validation path.
+pub(crate) fn validate_shape_parts(
+    tool: Tool,
+    anchors: Anchors,
+    text: Option<&str>,
+    fibonacci: Option<(&[f64], bool)>,
+) -> Result<(), String> {
     validate_anchor(anchors.first())?;
     if let Some(second) = anchors.second() {
         validate_anchor(second)?;
     }
-    match (shape, anchors) {
-        (Shape::Horizontal(_) | Shape::Vertical(_), Anchors::One(_)) => {}
-        (Shape::Text { text, .. }, Anchors::One(_)) => {
-            if text.trim().is_empty() {
+    match (tool, anchors) {
+        (Tool::Horizontal | Tool::Vertical | Tool::AnchoredVwap, Anchors::One(_)) => {}
+        (Tool::Text, Anchors::One(_)) => {
+            if text.is_none_or(|text| text.trim().is_empty()) {
                 return Err("Annotation text must not be empty".to_owned());
             }
         }
-        (Shape::Trend(_, _) | Shape::Ray(_, _), Anchors::Two(a, b)) => {
+        (Tool::Trend | Tool::Ray, Anchors::Two(a, b)) => {
             if a == b {
                 return Err("Line anchors must be distinct".to_owned());
             }
         }
-        (Shape::Rectangle(_, _), Anchors::Two(a, b)) => {
+        (Tool::Measure, Anchors::Two(a, b)) => {
+            if a == b {
+                return Err("Measurement anchors must be distinct".to_owned());
+            }
+        }
+        (Tool::Rectangle, Anchors::Two(a, b)) => {
             if a.utc_ms == b.utc_ms || a.price == b.price {
                 return Err("A rectangle needs different times and prices".to_owned());
             }
         }
-        (
-            Shape::Fibonacci {
-                levels, reverse, ..
-            },
-            Anchors::Two(a, b),
-        ) => {
+        (Tool::Fibonacci, Anchors::Two(a, b)) => {
+            let (levels, reverse) = fibonacci.ok_or("Fibonacci levels are missing")?;
             if a.price == b.price {
                 return Err("A Fibonacci swing needs different prices".to_owned());
             }
             if levels.is_empty() {
                 return Err("A Fibonacci drawing needs at least one level".to_owned());
             }
-            let (start, end) = if *reverse {
+            let (start, end) = if reverse {
                 (b.price, a.price)
             } else {
                 (a.price, b.price)
@@ -375,6 +663,7 @@ fn validate_shape_at(shape: &Shape, anchors: Anchors) -> Result<(), String> {
 /// Call only after validation, or when replaying an already-valid history delta.
 fn set_anchors(shape: &mut Shape, anchors: Anchors) {
     match (shape, anchors) {
+        (Shape::AnchoredVwap(at), Anchors::One(a)) => *at = Anchor { price: 0.0, ..a },
         (Shape::Horizontal(at) | Shape::Vertical(at) | Shape::Text { at, .. }, Anchors::One(a)) => {
             *at = a
         }
@@ -382,6 +671,7 @@ fn set_anchors(shape: &mut Shape, anchors: Anchors) {
             Shape::Trend(first, second)
             | Shape::Ray(first, second)
             | Shape::Rectangle(first, second)
+            | Shape::Measure(first, second)
             | Shape::Fibonacci {
                 a: first,
                 b: second,
@@ -421,6 +711,239 @@ mod tests {
         add(store, Shape::Horizontal(anchor(1_700_000_000_000, price)))
     }
 
+    #[test]
+    fn anchored_vwap_uses_shared_weighted_math_and_rebuilds_without_shifting_start() {
+        let candle = |time, price, volume| Candle {
+            time,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume,
+            flow: None,
+        };
+        let mut candles = vec![
+            candle(0, 10.0, 1.0),
+            candle(300, 20.0, 3.0),
+            candle(600, 40.0, 2.0),
+        ];
+        let market = Market::default();
+        let mut store = Store::new(&market);
+        let id = add(&mut store, Shape::AnchoredVwap(anchor(0, 999.0)));
+        assert_eq!(store.find(id).unwrap().shape.anchors().first().price, 0.0);
+        store.sync_vwap_preview(&candles, Timeframe::Min5, Some(0), None);
+        assert_eq!(store.vwap(id).unwrap().points[2].values[0], Some(25.0));
+        candles[2] = candle(600, 80.0, 2.0);
+        store.sync_vwap_preview(&candles, Timeframe::Min5, Some(2), None);
+        assert!((store.vwap(id).unwrap().points[2].values[0].unwrap() - 230.0 / 6.0).abs() < 1e-12);
+        store
+            .apply(Command::Move {
+                id,
+                anchors: Anchors::One(anchor(300_000, 1234.0)),
+            })
+            .unwrap();
+        store.sync_vwap_preview(&candles, Timeframe::Min5, None, None);
+        assert_eq!(store.vwap(id).unwrap().points[2].values[0], Some(44.0));
+        store.apply(Command::Undo).unwrap();
+        candles.insert(0, candle(-300, 5.0, 10.0));
+        store.sync_vwap_preview(&candles, Timeframe::Min5, Some(0), None);
+        assert_eq!(store.find(id).unwrap().shape.anchors().first().utc_ms, 0);
+        assert_eq!(store.vwap(id).unwrap().points[0].values[0], None);
+        assert!((store.vwap(id).unwrap().points[3].values[0].unwrap() - 230.0 / 6.0).abs() < 1e-12);
+        assert!(store.vwap(id).unwrap().context(3).unwrap().covered);
+        store
+            .apply(Command::Move {
+                id,
+                anchors: Anchors::One(anchor(-600_000, 0.0)),
+            })
+            .unwrap();
+        store.sync_vwap_preview(&candles, Timeframe::Min5, None, None);
+        assert!(!store.vwap(id).unwrap().context(3).unwrap().covered);
+        store
+            .apply(Command::SetLocked { id, locked: true })
+            .unwrap();
+        assert!(
+            store
+                .apply(Command::Move {
+                    id,
+                    anchors: Anchors::One(anchor(0, 0.0))
+                })
+                .is_err()
+        );
+        store
+            .apply(Command::SetVisible { id, visible: false })
+            .unwrap();
+        let saved = store.workspace_books();
+        let mut restored = Store::new(&market);
+        restored.restore_workspace(&market, &saved).unwrap();
+        restored.sync_vwap_preview(&candles, Timeframe::Min5, Some(0), None);
+        assert_eq!(restored.find(id), store.find(id));
+        assert_eq!(
+            restored.vwap(id).unwrap().points,
+            store.vwap(id).unwrap().points
+        );
+        store.apply(Command::Delete(id)).unwrap();
+        store.sync_vwap_preview(&candles, Timeframe::Min5, None, None);
+        assert!(store.vwap(id).is_none());
+        store.apply(Command::Undo).unwrap();
+        store.sync_vwap_preview(&candles, Timeframe::Min5, None, None);
+        assert_eq!(
+            store.find(id).unwrap().shape.anchors().first().utc_ms,
+            -600_000
+        );
+        let other = Market {
+            symbol: "ETH_USDC".into(),
+            ..market.clone()
+        };
+        store.switch_context(&other);
+        store.sync_vwap_preview(&[], Timeframe::Min5, Some(0), None);
+        assert!(store.vwap(id).is_none());
+        store.switch_context(&market);
+        store.sync_vwap_preview(&candles, Timeframe::Min5, Some(0), None);
+        assert_eq!(store.vwap(id).unwrap().points[3].values[0], Some(17.5));
+    }
+
+    #[test]
+    fn workspace_restore_preserves_books_and_flags_but_not_history_or_selection() {
+        let market = Market::default();
+        let mut store = Store::new(&market);
+        let first = line(&mut store, 10.0);
+        store
+            .apply(Command::SetVisible {
+                id: first,
+                visible: false,
+            })
+            .unwrap();
+        store
+            .apply(Command::SetLocked {
+                id: first,
+                locked: true,
+            })
+            .unwrap();
+        let other = Market {
+            symbol: "ETH_USDC".into(),
+            ..market.clone()
+        };
+        store.switch_context(&other);
+        let other_id = line(&mut store, 20.0);
+        assert_eq!(store.total_objects(), 2);
+        let saved = store.workspace_books();
+        let generation = store.generation();
+        store.restore_workspace(&market, &saved).unwrap();
+        assert_ne!(store.generation(), generation);
+        assert_eq!(store.workspace_books(), saved);
+        assert_eq!(store.total_objects(), 2);
+        assert_eq!(store.selected(), None);
+        assert_eq!(store.revision(), 0);
+        assert!(!store.can_undo());
+        assert!(!store.can_redo());
+        assert_eq!(store.objects().len(), 1);
+        assert_eq!(store.objects()[0].id, first);
+        assert!(!store.objects()[0].visible);
+        assert!(store.objects()[0].locked);
+        // An interval is a view detail, not a second drawing book.
+        store.switch_context(&Market {
+            interval: Timeframe::Day1,
+            ..market.clone()
+        });
+        assert_eq!(store.objects()[0].id, first);
+        let next = line(&mut store, 30.0);
+        assert_eq!(store.total_objects(), 3);
+        assert!(next > other_id);
+        store.switch_context(&other);
+        assert_eq!(store.objects()[0].id, other_id);
+        assert!(!store.can_undo());
+        assert_eq!(store.selected(), None);
+    }
+
+    #[test]
+    fn invalid_workspace_restore_leaves_every_book_and_generation_untouched() {
+        let market = Market::default();
+        let mut store = Store::new(&market);
+        let id = line(&mut store, 10.0);
+        let before = store.workspace_books();
+        let generation = store.generation();
+        let revision = store.revision();
+        let mut invalid = before.clone();
+        invalid[0].drawings[0].style.font_size = f32::INFINITY;
+        assert!(store.restore_workspace(&market, &invalid).is_err());
+        assert_eq!(store.workspace_books(), before);
+        assert_eq!(store.generation(), generation);
+        assert_eq!(store.revision(), revision);
+        assert_eq!(store.selected(), Some(id));
+        assert!(store.can_undo());
+        invalid = before.clone();
+        invalid.push(invalid[0].clone());
+        assert!(store.restore_workspace(&market, &invalid).is_err());
+        assert_eq!(store.workspace_books(), before);
+        assert_eq!(store.generation(), generation);
+    }
+
+    #[test]
+    fn restored_drawing_counter_never_wraps_or_reuses_global_ids() {
+        let market = Market::default();
+        let mut store = Store::new(&market);
+        line(&mut store, 10.0);
+        let mut saved = store.workspace_books();
+        saved[0].drawings[0].id = u64::MAX - 2;
+        store.restore_workspace(&market, &saved).unwrap();
+        assert_eq!(line(&mut store, 20.0), u64::MAX - 1);
+        let before = store.workspace_books();
+        assert!(
+            store
+                .apply(Command::Create {
+                    shape: Shape::Horizontal(anchor(0, 30.0)),
+                    style: Style::default()
+                })
+                .is_err()
+        );
+        assert_eq!(store.workspace_books(), before);
+        assert!(
+            store
+                .objects()
+                .iter()
+                .all(|drawing| drawing.id != 0 && drawing.id != u64::MAX)
+        );
+    }
+
+    #[test]
+    fn style_delta_is_noop_aware_locked_and_undoable_without_replacing_shape() {
+        let mut store = Store::new(&Market::default());
+        let id = line(&mut store, 10.0);
+        let shape = store.find(id).unwrap().shape.clone();
+        let revision = store.revision();
+        assert!(
+            !store
+                .apply(Command::Style {
+                    id,
+                    style: Style::default()
+                })
+                .unwrap()
+        );
+        assert_eq!(store.revision(), revision);
+        let style = Style {
+            width: 3.5,
+            ..Style::default()
+        };
+        assert!(store.apply(Command::Style { id, style }).unwrap());
+        assert_eq!(store.find(id).unwrap().shape, shape);
+        assert_eq!(store.find(id).unwrap().style.width, 3.5);
+        store.apply(Command::Undo).unwrap();
+        assert_eq!(store.find(id).unwrap().style, Style::default());
+        store.apply(Command::Redo).unwrap();
+        assert_eq!(store.find(id).unwrap().style, style);
+        store
+            .apply(Command::SetLocked { id, locked: true })
+            .unwrap();
+        assert!(
+            store
+                .apply(Command::Style {
+                    id,
+                    style: Style::default()
+                })
+                .is_err()
+        );
+    }
     #[test]
     fn native_books_isolate_venue_product_and_exact_symbol_but_reuse_timeframes() {
         let original = Market::default();
@@ -620,13 +1143,17 @@ mod tests {
         assert_eq!(store.revision(), revision);
         let mut styling = replacement.clone();
         styling.style.font_size = 24.0;
-        assert!(store.apply(Command::Replace(styling)).unwrap());
+        assert!(store.apply(Command::Replace(styling.clone())).is_err());
+        assert_eq!(store.revision(), revision);
         store
             .apply(Command::SetVisible { id, visible: true })
             .unwrap();
         store
             .apply(Command::SetLocked { id, locked: false })
             .unwrap();
+        styling.locked = false;
+        styling.visible = true;
+        store.apply(Command::Replace(styling)).unwrap();
         store
             .apply(Command::Move {
                 id,

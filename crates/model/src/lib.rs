@@ -1,3 +1,5 @@
+pub mod executions;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Exchange {
     Binance,
@@ -195,6 +197,8 @@ pub struct Instrument {
     pub quote_coin: Quote,
     pub settle_coin: String,
     pub price_scale: u32,
+    /// Authoritative native executable price increment; never inferred from display precision.
+    pub tick_size: Option<rust_decimal::Decimal>,
     pub contract_size: f64,
     pub inverse: bool,
     pub volume_unit: String,

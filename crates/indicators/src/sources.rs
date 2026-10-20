@@ -143,6 +143,23 @@ pub struct SourceData {
     zero_coverage: BTreeMap<i64, (i64, FlowQuality)>,
 }
 
+/// Current feed diagnostics, independent of historical aggregate readouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceCondition {
+    Disconnected,
+    MissingObservation,
+    Stale,
+    IncompleteCoverage,
+    Current,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SourceDiagnostics {
+    pub condition: SourceCondition,
+    pub asof_ms: Option<i64>,
+    pub timestamp_source: Option<OpenInterestTimestamp>,
+}
+
 impl SourceData {
     pub fn new(market: Market, base_asset: String) -> Self {
         Self {
@@ -162,6 +179,54 @@ impl SourceData {
             revoked: HashSet::new(),
             zero_coverage: BTreeMap::new(),
             mutation_floor: 0,
+        }
+    }
+
+    /// Uses the same native freshness and coverage rules as aggregation.
+    /// `point_time` is the aggregate's latest CVD bucket, never the inspection cursor.
+    pub fn diagnostics(&self, oi: bool, point_time: Option<i64>, now_ms: i64) -> SourceDiagnostics {
+        let asof_ms = if oi {
+            self.oi.last().map(|sample| sample.timestamp_ms)
+        } else {
+            self.flows.last_key_value().map(|(_, flow)| flow.through_ms)
+        };
+        let covered = if oi {
+            self.oi.last().is_some_and(|sample| valid_oi(*sample))
+        } else {
+            point_time
+                .and_then(|time| source_bucket(self, time, self.market.interval.seconds()))
+                .is_some()
+        };
+        let condition = if !(if oi {
+            self.oi_connected
+        } else {
+            self.flow_connected
+        }) {
+            SourceCondition::Disconnected
+        } else if asof_ms.is_none() {
+            SourceCondition::MissingObservation
+        } else if !oi
+            && self
+                .flows
+                .last_key_value()
+                .is_some_and(|(_, flow)| flow.quality == FlowQuality::Missing)
+        {
+            SourceCondition::IncompleteCoverage
+        } else if !feed_fresh(self, oi, now_ms) {
+            SourceCondition::Stale
+        } else if !covered {
+            SourceCondition::IncompleteCoverage
+        } else {
+            SourceCondition::Current
+        };
+        SourceDiagnostics {
+            condition,
+            asof_ms,
+            timestamp_source: if oi {
+                self.oi.last().map(|sample| sample.timestamp_source)
+            } else {
+                None
+            },
         }
     }
 

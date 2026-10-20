@@ -103,6 +103,12 @@ pub async fn catalog(client: &Client, exchange: Exchange, product: Product) -> R
             instrument.contract_size.is_finite() && instrument.contract_size > 0.0,
             "invalid native contract size"
         );
+        ensure!(
+            instrument
+                .tick_size
+                .is_none_or(|tick| tick > rust_decimal::Decimal::ZERO),
+            "invalid native tick increment"
+        );
     }
     ensure!(
         catalog
@@ -170,6 +176,38 @@ pub async fn stream(
         Exchange::Mexc => {
             mexc::stream(client, instrument, market, cvd, sender, shutdown, quantity).await
         }
+    }
+}
+
+pub async fn execution_history(
+    client: &Client,
+    instrument: &Instrument,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<mexc_model::executions::ExecutionPage> {
+    match instrument.exchange {
+        Exchange::Binance => binance::execution_history(client, instrument, start_ms, end_ms).await,
+        Exchange::Okx => okx::execution_history(client, instrument, start_ms, end_ms).await,
+        Exchange::Coinbase => {
+            coinbase::execution_history(client, instrument, start_ms, end_ms).await
+        }
+        Exchange::Mexc => mexc::execution_history(client, instrument, start_ms, end_ms).await,
+    }
+}
+
+pub async fn execution_session(
+    client: &Client,
+    instrument: &Instrument,
+    sender: &mpsc::Sender<mexc_model::executions::ExecutionEvent>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    match instrument.exchange {
+        Exchange::Binance => binance::execution_session(client, instrument, sender, shutdown).await,
+        Exchange::Okx => okx::execution_session(client, instrument, sender, shutdown).await,
+        Exchange::Coinbase => {
+            coinbase::execution_session(client, instrument, sender, shutdown).await
+        }
+        Exchange::Mexc => mexc::execution_session(client, instrument, sender, shutdown).await,
     }
 }
 

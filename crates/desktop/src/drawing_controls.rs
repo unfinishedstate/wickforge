@@ -18,11 +18,16 @@ pub const BODY_ID: &str = "drawing-controls-body";
 #[derive(Debug, Clone)]
 pub enum Event {
     ChooseTool(Tool),
+    SelectedVolumeProfile,
     Select(DrawingId),
     Properties(DrawingId),
     Field(Field, String),
     Ink(Ink),
     Pattern(Pattern),
+    QuickInk(Ink),
+    QuickPattern(Pattern),
+    QuickWidth(f32),
+    Repeat(bool),
     FibReverse(bool),
     FibExtendRight(bool),
     Apply,
@@ -55,9 +60,11 @@ pub enum Field {
 pub enum Effect {
     None,
     ChooseTool(Tool),
+    SelectedVolumeProfile,
     Select(Option<DrawingId>),
     Magnet(bool),
     ToggleMagnet,
+    Repeat(bool),
     Commit(Command),
     Close,
 }
@@ -190,14 +197,28 @@ impl Draft {
     }
 
     fn shape_and_style(&self) -> Result<(Shape, Style), String> {
-        let first = Self::anchor(&self.utc_first, &self.price_first, "First")?;
-        let second = Self::anchor(&self.utc_second, &self.price_second, "Second")?;
+        let anchored = matches!(self.shape, Shape::AnchoredVwap(_));
+        let first = Self::anchor(
+            &self.utc_first,
+            if anchored { "0" } else { &self.price_first },
+            "First",
+        )?;
+        let second = if anchored {
+            first
+        } else {
+            Self::anchor(&self.utc_second, &self.price_second, "Second")?
+        };
         let shape = match &self.shape {
             Shape::Horizontal(_) => Shape::Horizontal(first),
             Shape::Vertical(_) => Shape::Vertical(first),
+            Shape::AnchoredVwap(_) => Shape::AnchoredVwap(Anchor {
+                price: 0.0,
+                ..first
+            }),
             Shape::Trend(_, _) => Shape::Trend(first, second),
             Shape::Ray(_, _) => Shape::Ray(first, second),
             Shape::Rectangle(_, _) => Shape::Rectangle(first, second),
+            Shape::Measure(_, _) => Shape::Measure(first, second),
             Shape::Fibonacci {
                 reverse,
                 extend_right,
@@ -265,6 +286,12 @@ impl Controls {
     pub fn is_editing(&self) -> bool {
         self.draft.is_some()
     }
+    pub fn is_new_text(&self) -> bool {
+        matches!(
+            self.draft.as_ref().map(|draft| &draft.kind),
+            Some(DraftKind::NewText)
+        )
+    }
     pub fn context_generation(&self) -> u64 {
         self.generation
     }
@@ -272,12 +299,13 @@ impl Controls {
         let draft = self.draft.as_ref()?;
         let field = match &draft.shape {
             Shape::Text { .. } => Field::Text,
+            Shape::Vertical(_) | Shape::AnchoredVwap(_) => Field::UtcFirst,
             Shape::Horizontal(_)
             | Shape::Trend(_, _)
             | Shape::Ray(_, _)
+            | Shape::Measure(_, _)
             | Shape::Rectangle(_, _)
             | Shape::Fibonacci { .. } => Field::PriceFirst,
-            Shape::Vertical(_) => Field::UtcFirst,
         };
         Some(field_id(field))
     }
@@ -318,11 +346,35 @@ impl Controls {
     }
 
     pub fn update(&mut self, event: Event, store: &Store) -> Effect {
-        if !self.open || self.generation != store.generation() {
+        if self.generation != store.generation()
+            && !matches!(
+                &event,
+                Event::QuickInk(_)
+                    | Event::QuickPattern(_)
+                    | Event::QuickWidth(_)
+                    | Event::Repeat(_)
+            )
+        {
+            return Effect::None;
+        }
+        if !self.open
+            && !matches!(
+                &event,
+                Event::QuickInk(_)
+                    | Event::QuickPattern(_)
+                    | Event::QuickWidth(_)
+                    | Event::Repeat(_)
+            )
+        {
             return Effect::None;
         }
         match event {
+            Event::QuickInk(ink) => style_effect(store, |style| style.ink = ink),
+            Event::QuickPattern(pattern) => style_effect(store, |style| style.pattern = pattern),
+            Event::QuickWidth(width) => style_effect(store, |style| style.width = width),
+            Event::Repeat(repeat) => Effect::Repeat(repeat),
             Event::ChooseTool(tool) => Effect::ChooseTool(tool),
+            Event::SelectedVolumeProfile => Effect::SelectedVolumeProfile,
             Event::Select(id) => {
                 if self.draft.is_none() && store.find(id).is_some() {
                     Effect::Select(Some(id))
@@ -507,12 +559,49 @@ impl Controls {
         store: &Store,
     ) -> Option<Event> {
         use keyboard::{Key, key::Named};
+        if self.draft.is_none()
+            && modifiers.control()
+            && modifiers.alt()
+            && let Some(drawing) = store.selected_drawing()
+        {
+            if drawing.locked {
+                return None;
+            }
+            return match key {
+                Key::Character("k" | "K") => {
+                    let index = Ink::ALL
+                        .iter()
+                        .position(|ink| *ink == drawing.style.ink)
+                        .unwrap_or(0);
+                    Some(Event::QuickInk(Ink::ALL[(index + 1) % Ink::ALL.len()]))
+                }
+                Key::Character("p" | "P") if !matches!(drawing.shape, Shape::Text { .. }) => {
+                    let index = Pattern::ALL
+                        .iter()
+                        .position(|pattern| *pattern == drawing.style.pattern)
+                        .unwrap_or(0);
+                    Some(Event::QuickPattern(
+                        Pattern::ALL[(index + 1) % Pattern::ALL.len()],
+                    ))
+                }
+                Key::Character("[") => {
+                    Some(Event::QuickWidth((drawing.style.width - 0.5).max(0.5)))
+                }
+                Key::Character("]") => {
+                    Some(Event::QuickWidth((drawing.style.width + 0.5).min(20.0)))
+                }
+                _ => None,
+            };
+        }
         if !self.open {
             return None;
         }
         if modifiers.control() && !modifiers.alt() {
             match key {
                 Key::Named(Named::Enter) if self.draft.is_some() => return Some(Event::Apply),
+                Key::Character("p" | "P") if self.draft.is_none() => {
+                    return Some(Event::SelectedVolumeProfile);
+                }
                 Key::Character("z" | "Z") if self.draft.is_none() && modifiers.shift() => {
                     return store.can_redo().then_some(Event::Redo);
                 }
@@ -591,193 +680,501 @@ impl Controls {
             Key::Character("5") => Some(Event::ChooseTool(Tool::Rectangle)),
             Key::Character("6") => Some(Event::ChooseTool(Tool::Fibonacci)),
             Key::Character("7") => Some(Event::ChooseTool(Tool::Text)),
+            Key::Character("8") => Some(Event::ChooseTool(Tool::Measure)),
+            Key::Character("9") => Some(Event::ChooseTool(Tool::AnchoredVwap)),
             _ => None,
         }
+    }
+    pub fn context_style_view(&self, store: &Store) -> Element<'_, Message> {
+        let Some(drawing) = store.selected_drawing() else {
+            return iced::widget::Space::new(Length::Shrink, Length::Shrink).into();
+        };
+        let id = drawing.id;
+        let generation = store.generation();
+        let locked = drawing.locked;
+        let is_text = matches!(drawing.shape, Shape::Text { .. });
+        let style = drawing.style;
+        let ink: Element<'_, Message> = if locked {
+            text(style.ink.to_string()).into()
+        } else {
+            pick_list(Ink::ALL, Some(style.ink), move |value| {
+                Message::DrawingCommand {
+                    generation,
+                    command: Command::Style {
+                        id,
+                        style: Style {
+                            ink: value,
+                            ..style
+                        },
+                    },
+                }
+            })
+            .style(crate::ui::pick)
+            .text_size(12)
+            .padding([4, 6])
+            .into()
+        };
+        let pattern: Element<'_, Message> = if locked || is_text {
+            text(style.pattern.to_string()).into()
+        } else {
+            pick_list(Pattern::ALL, Some(style.pattern), move |value| {
+                Message::DrawingCommand {
+                    generation,
+                    command: Command::Style {
+                        id,
+                        style: Style {
+                            pattern: value,
+                            ..style
+                        },
+                    },
+                }
+            })
+            .style(crate::ui::pick)
+            .text_size(12)
+            .padding([4, 6])
+            .into()
+        };
+        if is_text {
+            return row![text("Ink").size(11), ink]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+                .into();
+        }
+        row![
+            text("Ink").size(11),
+            ink,
+            text("Stroke").size(11),
+            pattern,
+            button("−")
+                .style(crate::ui::quiet)
+                .on_press_maybe((!locked).then_some(Message::DrawingCommand {
+                    generation,
+                    command: Command::Style {
+                        id,
+                        style: Style {
+                            width: (style.width - 0.5).max(0.5),
+                            ..style
+                        }
+                    }
+                })),
+            text(format!("{:.1}", style.width)).size(11),
+            button("+")
+                .style(crate::ui::quiet)
+                .on_press_maybe((!locked).then_some(Message::DrawingCommand {
+                    generation,
+                    command: Command::Style {
+                        id,
+                        style: Style {
+                            width: (style.width + 0.5).min(20.0),
+                            ..style
+                        }
+                    }
+                })),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center)
+        .into()
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn view<'a>(
         &'a self,
         store: &'a Store,
+        profiles: &'a [mexc_indicators::profiles::Instance],
         tool: Tool,
         magnet: bool,
         ready: bool,
-        palette: Palette,
+        _palette: Palette,
         price_scale: u32,
         quote: &'a str,
+        repeat: bool,
     ) -> Element<'a, Message> {
-        let mut head = row![
-            text("Draw").size(18),
-            text(format!("{} · {}", store.key(), tool)).size(12)
+        iced::widget::responsive(move |size| {
+            self.dialog_view(
+                store,
+                profiles,
+                tool,
+                magnet,
+                ready,
+                price_scale,
+                quote,
+                repeat,
+                size.width >= 600.0,
+            )
+        })
+        .into()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dialog_view<'a>(
+        &'a self,
+        store: &'a Store,
+        profiles: &'a [mexc_indicators::profiles::Instance],
+        tool: Tool,
+        magnet: bool,
+        ready: bool,
+        price_scale: u32,
+        quote: &'a str,
+        repeat: bool,
+        wide: bool,
+    ) -> Element<'a, Message> {
+        let editing = self.draft.is_some();
+        let header = column![
+            text(if editing {
+                "Drawing properties"
+            } else {
+                "Drawings"
+            })
+            .size(18),
+            text(format!(
+                "{} · {}{}",
+                store.key(),
+                tool,
+                if ready {
+                    ""
+                } else {
+                    " · waiting for native candles"
+                }
+            ))
+            .size(11)
+            .style(crate::ui::muted_text),
         ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center);
-        if ready {
-            head = head.push(text("Ready").size(12));
-        }
-        let mut body = column![].spacing(8);
+        .spacing(4);
+
+        let mut body = column![].spacing(10).width(Length::Fill);
         if let Some(draft) = &self.draft {
-            body = body.push(text("Ctrl+Enter apply · Ctrl+Alt+K ink · Ctrl+Alt+P stroke · Ctrl+Alt+R/E Fibonacci reverse/extend").size(12));
-            body = body.push(
-                text(match &draft.kind {
-                    DraftKind::NewText => "New text",
-                    DraftKind::Edit(_) => "Drawing properties",
-                })
-                .size(15),
-            );
-            body = body.push(field(
-                "UTC · first (ISO-8601 or milliseconds)",
+            let is_vwap = matches!(draft.shape, Shape::AnchoredVwap(_));
+            let mut first_fields = column![field(
+                "UTC · ISO-8601 or milliseconds",
                 Field::UtcFirst,
-                &draft.utc_first,
-            ));
-            body = body.push(field(
-                format!("Price · {quote} (precision {price_scale}) · first"),
-                Field::PriceFirst,
-                &draft.price_first,
-            ));
-            if draft.shape.anchors().second().is_some() {
-                body = body.push(field(
-                    "UTC · second (ISO-8601 or milliseconds)",
-                    Field::UtcSecond,
-                    &draft.utc_second,
-                ));
-                body = body.push(field(
-                    format!("Price · {quote} (precision {price_scale}) · second"),
-                    Field::PriceSecond,
-                    &draft.price_second,
+                &draft.utc_first
+            ),]
+            .spacing(8);
+            if is_vwap {
+                first_fields = first_fields.push(text(
+                    "Start time only; price is derived from native HLC3 × candle volume. A typed mid-bar start uses the first later opening; unavailable history remains partial."
+                ).size(11).style(crate::ui::muted_text));
+                if let DraftKind::Edit(id) = draft.kind
+                    && let Some(cache) = store.vwap(id)
+                {
+                    first_fields = first_fields.push(text(cache.status()).size(11));
+                }
+            } else {
+                first_fields = first_fields.push(field(
+                    format!("Price · {quote} · precision {price_scale}"),
+                    Field::PriceFirst,
+                    &draft.price_first,
                 ));
             }
-            if matches!(&draft.shape, Shape::Text { .. }) {
-                body = body.push(field("Text", Field::Text, &draft.text));
-                body = body.push(field("Text size", Field::FontSize, &draft.font_size));
-                body = body.push(
-                    row![
-                        text("Ink"),
-                        pick_list(
-                            Ink::ALL,
-                            Some(draft.style.ink),
-                            |v| Message::DrawingControl(Event::Ink(v))
-                        )
-                    ]
-                    .spacing(8),
-                );
-            } else {
-                body = body.push(
-                    row![
-                        text("Ink"),
-                        pick_list(
-                            Ink::ALL,
-                            Some(draft.style.ink),
-                            |v| Message::DrawingControl(Event::Ink(v))
-                        )
-                    ]
-                    .spacing(8),
-                );
-                body = body.push(
-                    row![
-                        text("Stroke"),
-                        pick_list(Pattern::ALL, Some(draft.style.pattern), |v| {
-                            Message::DrawingControl(Event::Pattern(v))
-                        }),
-                        field("Width", Field::Width, &draft.width)
+            let first = section(
+                if is_vwap { "VWAP start" } else { "Anchor A" },
+                first_fields.into(),
+            );
+            let anchors: Element<'a, Message> = if draft.shape.anchors().second().is_some() {
+                let second = section(
+                    "Anchor B",
+                    column![
+                        field(
+                            "UTC · ISO-8601 or milliseconds",
+                            Field::UtcSecond,
+                            &draft.utc_second
+                        ),
+                        field(
+                            format!("Price · {quote} · precision {price_scale}"),
+                            Field::PriceSecond,
+                            &draft.price_second
+                        ),
                     ]
                     .spacing(8)
-                    .wrap(),
+                    .into(),
                 );
-                if matches!(&draft.shape, Shape::Rectangle(_, _)) {
-                    body = body.push(field(
-                        "Fill opacity (0–1)",
-                        Field::FillOpacity,
-                        &draft.fill_opacity,
-                    ));
+                if wide {
+                    row![first, second].spacing(10).width(Length::Fill).into()
+                } else {
+                    column![first, second]
+                        .spacing(10)
+                        .width(Length::Fill)
+                        .into()
                 }
-                if let Shape::Fibonacci {
-                    reverse,
-                    extend_right,
-                    ..
-                } = &draft.shape
-                {
-                    body = body.push(field("Label size", Field::FontSize, &draft.font_size));
-                    body = body.push(field(
-                        "Fib levels · comma separated ratios",
+            } else {
+                first
+            };
+            body = body.push(anchors);
+            let mut appearance = column![].spacing(8).width(Length::Fill);
+            if matches!(&draft.shape, Shape::Text { .. }) {
+                appearance = appearance
+                    .push(field("Text", Field::Text, &draft.text))
+                    .push(field("Text size", Field::FontSize, &draft.font_size));
+            }
+            appearance = appearance.push(
+                row![
+                    text("Ink").size(12),
+                    pick_list(Ink::ALL, Some(draft.style.ink), |v| {
+                        Message::DrawingControl(Event::Ink(v))
+                    })
+                    .style(crate::ui::pick)
+                    .width(Length::Fill),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            );
+            if !matches!(&draft.shape, Shape::Text { .. }) {
+                appearance = appearance.push(
+                    row![
+                        column![
+                            text("Stroke").size(11).style(crate::ui::muted_text),
+                            pick_list(Pattern::ALL, Some(draft.style.pattern), |v| {
+                                Message::DrawingControl(Event::Pattern(v))
+                            })
+                            .style(crate::ui::pick)
+                            .text_size(13)
+                            .width(Length::Fill),
+                        ]
+                        .spacing(4)
+                        .width(Length::FillPortion(2)),
+                        container(field("Width", Field::Width, &draft.width))
+                            .width(Length::FillPortion(1)),
+                    ]
+                    .spacing(10),
+                );
+            }
+            if matches!(&draft.shape, Shape::Fibonacci { .. }) {
+                appearance = appearance
+                    .push(field("Label size", Field::FontSize, &draft.font_size))
+                    .push(field(
+                        "Fib levels · comma-separated ratios",
                         Field::FibLevels,
                         &draft.levels,
                     ));
-                    body = body.push(
+            }
+            if matches!(&draft.shape, Shape::Rectangle(_, _)) {
+                appearance = appearance.push(field(
+                    "Fill opacity (0–1)",
+                    Field::FillOpacity,
+                    &draft.fill_opacity,
+                ));
+            }
+            if let Shape::Fibonacci {
+                reverse,
+                extend_right,
+                ..
+            } = &draft.shape
+            {
+                appearance = appearance.push(
+                    row![
                         checkbox("Reverse", *reverse)
                             .on_toggle(|v| Message::DrawingControl(Event::FibReverse(v))),
-                    );
-                    body = body.push(
                         checkbox("Extend right", *extend_right)
                             .on_toggle(|v| Message::DrawingControl(Event::FibExtendRight(v))),
+                    ]
+                    .spacing(16)
+                    .wrap(),
+                );
+            }
+            body = body.push(section("Appearance", appearance.into()));
+        } else {
+            body = body.push(text("TOOLS").size(11).style(crate::ui::muted_text));
+            let columns = if wide { 4 } else { 2 };
+            let choices = Tool::ALL;
+            let mut tool_rows = column![].spacing(5).width(Length::Fill);
+            for group in choices.chunks(columns) {
+                let mut tool_row = row![].spacing(5).width(Length::Fill);
+                for choice in group {
+                    let index = Tool::ALL
+                        .iter()
+                        .position(|candidate| candidate == choice)
+                        .unwrap_or(0);
+                    let label = match choice {
+                        Tool::Select => "Select",
+                        Tool::Horizontal => "H-line",
+                        Tool::Vertical => "V-line",
+                        Tool::Trend => "Trend",
+                        Tool::Ray => "Ray",
+                        Tool::Rectangle => "Zone",
+                        Tool::Fibonacci => "Fib",
+                        Tool::Text => "Text",
+                        Tool::Measure => "Measure",
+                        Tool::AnchoredVwap => "Anchored VWAP",
+                    };
+                    let action = (ready || *choice == Tool::Select)
+                        .then_some(Message::DrawingControl(Event::ChooseTool(*choice)));
+                    let selected = *choice == tool;
+                    tool_row = tool_row.push(
+                        button(
+                            row![crate::ui::key((index).to_string()), text(label).size(12),]
+                                .spacing(6)
+                                .align_y(iced::Alignment::Center),
+                        )
+                        .width(Length::FillPortion(1))
+                        .padding([6, 8])
+                        .style(move |theme, status| {
+                            if selected {
+                                crate::ui::selected(theme, status)
+                            } else {
+                                crate::ui::quiet(theme, status)
+                            }
+                        })
+                        .on_press_maybe(action),
                     );
                 }
+                for _ in group.len()..columns {
+                    tool_row = tool_row.push(iced::widget::Space::new(
+                        Length::FillPortion(1),
+                        Length::Shrink,
+                    ));
+                }
+                tool_rows = tool_rows.push(tool_row);
             }
-        } else {
-            body = body.push(text("Tools · 0–7").size(14));
-            body = body.push(text("Up/Down objects · Enter edit · Ctrl+H show/hide · Ctrl+L lock · Delete · Ctrl+M magnet").size(12));
-            let mut tools = row![].spacing(4);
-            for choice in Tool::ALL {
-                let action = (ready || choice == Tool::Select)
-                    .then_some(Message::DrawingControl(Event::ChooseTool(choice)));
-                tools = tools.push(button(text(choice.to_string())).on_press_maybe(action));
-            }
-            body = body.push(tools.wrap()).push(text("Objects").size(14));
-            let mut rows = column![].spacing(4);
+            body = body.push(tool_rows);
+            body = body.push(
+                button("Selected Range Volume Profile · Ctrl+P")
+                    .style(crate::ui::quiet)
+                    .width(Length::Fill)
+                    .on_press_maybe(
+                        ready.then_some(Message::DrawingControl(Event::SelectedVolumeProfile)),
+                    ),
+            );
+            body = body.push(
+                row![
+                    text("OBJECTS").size(11).style(crate::ui::muted_text),
+                    iced::widget::Space::new(Length::Fill, Length::Shrink),
+                    text("Up/Down select · Enter edit")
+                        .size(11)
+                        .style(crate::ui::muted_text),
+                ]
+                .align_y(iced::Alignment::Center),
+            );
+            let mut objects = column![].spacing(3).width(Length::Fill);
             for drawing in store.objects() {
                 let selected = store.selected() == Some(drawing.id);
                 let status = format!(
                     "{}{}{}",
-                    if drawing.visible { "shown" } else { "hidden" },
+                    if drawing.visible { "visible" } else { "hidden" },
                     if drawing.locked { " · locked" } else { "" },
-                    if selected { " · selected" } else { "" }
+                    if selected { " · selected" } else { "" },
                 );
-                let label = format!("{} #{}\n{}", drawing.shape.tool(), drawing.id, status);
-                rows = rows.push(
-                    row![
-                        button(text(label).size(12))
-                            .width(Length::Fill)
-                            .on_press(Message::DrawingControl(Event::Select(drawing.id))),
-                        button("Edit")
-                            .on_press(Message::DrawingControl(Event::Properties(drawing.id))),
-                        button(if drawing.visible { "Hide" } else { "Show" })
-                            .on_press(Message::DrawingControl(Event::Hide(drawing.id))),
-                        button(if drawing.locked { "Unlock" } else { "Lock" })
-                            .on_press(Message::DrawingControl(Event::Lock(drawing.id))),
-                        button("Delete")
-                            .on_press(Message::DrawingControl(Event::Delete(drawing.id))),
-                    ]
-                    .spacing(4)
-                    .align_y(iced::Alignment::Center)
-                    .wrap(),
+                objects = objects.push(
+                    button(
+                        row![
+                            text(format!("#{}", drawing.id)).size(12),
+                            text(drawing.shape.tool().to_string()).size(12),
+                            iced::widget::Space::new(Length::Fill, Length::Shrink),
+                            text(status).size(11).style(crate::ui::muted_text),
+                        ]
+                        .spacing(8)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .padding([7, 9])
+                    .style(move |theme, status| {
+                        if selected {
+                            crate::ui::selected(theme, status)
+                        } else {
+                            crate::ui::quiet(theme, status)
+                        }
+                    })
+                    .on_press(Message::DrawingControl(Event::Select(drawing.id))),
                 );
             }
             if store.objects().is_empty() {
-                rows = rows.push(text("No drawings yet.").size(12));
+                objects = objects.push(
+                    text("No drawings yet")
+                        .size(12)
+                        .style(crate::ui::muted_text),
+                );
             }
-            body = body.push(rows);
+            body = body.push(objects);
+            let mut ranges = column![text("PROFILE RANGES").size(11)].spacing(5);
+            for profile in profiles.iter().filter(|profile| {
+                matches!(
+                    profile.spec.range,
+                    mexc_indicators::profiles::Range::Fixed { .. }
+                )
+            }) {
+                ranges = ranges.push(
+                    row![
+                        button(text(format!(
+                            "Select {} #{}{}",
+                            profile.spec.kind,
+                            profile.id,
+                            if profile.visible { "" } else { " · hidden" }
+                        )))
+                        .style(crate::ui::quiet)
+                        .on_press(Message::ProfileEdit(
+                            crate::profile_layer::Edit::Select(profile.id)
+                        )),
+                        button("Settings / visibility / delete")
+                            .style(crate::ui::quiet)
+                            .on_press(Message::Profile(crate::profile_controls::Event::Open(
+                                Some(profile.id)
+                            ))),
+                    ]
+                    .spacing(5),
+                );
+            }
+            body = body.push(ranges);
         }
-        let editing = self.draft.is_some();
-        let mut footer = row![
-            button(if store.can_undo() { "Undo" } else { "Undo ·" }).on_press_maybe(
-                (!editing && store.can_undo()).then_some(Message::DrawingControl(Event::Undo))
-            ),
-            button(if store.can_redo() { "Redo" } else { "Redo ·" }).on_press_maybe(
-                (!editing && store.can_redo()).then_some(Message::DrawingControl(Event::Redo))
-            ),
-            checkbox("Magnet", magnet).on_toggle(|v| Message::DrawingControl(Event::Magnet(v))),
-        ]
-        .spacing(5);
-        if editing {
-            footer = footer
-                .push(button("Apply").on_press(Message::DrawingControl(Event::Apply)))
-                .push(button("Cancel edit").on_press(Message::DrawingControl(Event::Cancel)));
+
+        let mut footer = column![].spacing(7).width(Length::Fill);
+        if !editing && let Some(drawing) = store.selected_drawing() {
+            let id = drawing.id;
+            footer = footer.push(
+                row![
+                    text(format!("Selected · #{} · {}", id, drawing.shape.tool())).size(12),
+                    button("Edit")
+                        .style(crate::ui::quiet)
+                        .on_press(Message::DrawingControl(Event::Properties(id))),
+                    button(if drawing.visible { "Hide" } else { "Show" })
+                        .style(crate::ui::quiet)
+                        .on_press(Message::DrawingControl(Event::Hide(id))),
+                    button(if drawing.locked { "Unlock" } else { "Lock" })
+                        .style(crate::ui::quiet)
+                        .on_press(Message::DrawingControl(Event::Lock(id))),
+                    button("Delete")
+                        .style(crate::ui::danger)
+                        .on_press(Message::DrawingControl(Event::Delete(id))),
+                ]
+                .spacing(5)
+                .align_y(iced::Alignment::Center)
+                .wrap(),
+            );
         }
-        let footer = footer
-            .push(button("Close").on_press(Message::DrawingControl(Event::Close)))
-            .wrap();
+        let ending: Element<'a, Message> = if editing {
+            row![
+                button("Cancel")
+                    .style(crate::ui::quiet)
+                    .on_press(Message::DrawingControl(Event::Cancel)),
+                button("Apply")
+                    .style(crate::ui::primary)
+                    .on_press(Message::DrawingControl(Event::Apply)),
+            ]
+            .spacing(6)
+            .into()
+        } else {
+            button("Close")
+                .style(crate::ui::quiet)
+                .on_press(Message::DrawingControl(Event::Close))
+                .into()
+        };
+        footer = footer.push(
+            row![
+                button("Undo").style(crate::ui::quiet).on_press_maybe(
+                    (!editing && store.can_undo()).then_some(Message::DrawingControl(Event::Undo))
+                ),
+                button("Redo").style(crate::ui::quiet).on_press_maybe(
+                    (!editing && store.can_redo()).then_some(Message::DrawingControl(Event::Redo))
+                ),
+                checkbox("Magnet", magnet).on_toggle(|v| Message::DrawingControl(Event::Magnet(v))),
+                checkbox("Repeat tool", repeat)
+                    .on_toggle(|v| Message::DrawingControl(Event::Repeat(v))),
+                iced::widget::Space::new(Length::Fill, Length::Shrink),
+                ending,
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+        );
         let mut content = column![
-            head,
+            header,
             scrollable(container(body).padding(iced::Padding {
                 right: 16.0,
                 ..iced::Padding::default()
@@ -785,7 +1182,7 @@ impl Controls {
             .id(scrollable::Id::new(BODY_ID))
             .height(Length::Fill),
         ]
-        .spacing(8)
+        .spacing(9)
         .height(Length::Fill);
         if let Some(error) = self
             .draft
@@ -795,31 +1192,46 @@ impl Controls {
         {
             content = content.push(text(error).size(12));
         }
-        container(content.push(footer))
-            .padding(10)
+        content = content.push(crate::ui::separator()).push(footer);
+        container(content)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(move |_| iced::widget::container::Style {
-                background: Some(palette.background.into()),
-                text_color: Some(palette.foreground),
-                border: iced::Border {
-                    color: palette.muted,
-                    width: 1.0,
-                    radius: 6.0.into(),
-                },
-                ..Default::default()
-            })
             .into()
     }
+}
+fn style_effect(store: &Store, update: impl FnOnce(&mut Style)) -> Effect {
+    let Some(drawing) = store.selected_drawing() else {
+        return Effect::None;
+    };
+    let mut style = drawing.style;
+    update(&mut style);
+    Effect::Commit(Command::Style {
+        id: drawing.id,
+        style,
+    })
+}
+
+fn section<'a>(title: &'static str, content: Element<'a, Message>) -> Element<'a, Message> {
+    container(
+        column![text(title).size(13), content]
+            .spacing(7)
+            .width(Length::Fill),
+    )
+    .padding([8, 9])
+    .width(Length::Fill)
+    .style(crate::ui::card)
+    .into()
 }
 
 fn field<'a>(label: impl Into<String>, field: Field, value: &'a str) -> Element<'a, Message> {
     column![
-        text(label.into()).size(12),
+        text(label.into()).size(11).style(crate::ui::muted_text),
         text_input("", value)
             .id(field_id(field))
+            .size(13)
             .on_input(move |value| Message::DrawingControl(Event::Field(field, value)))
             .width(Length::Fill)
+            .style(crate::ui::input)
     ]
     .spacing(4)
     .width(Length::Fill)
@@ -840,6 +1252,43 @@ fn utc_field(utc_ms: i64) -> String {
 mod tests {
     use super::*;
     use mexc_model::Market;
+
+    #[test]
+    fn anchored_vwap_properties_edit_utc_without_an_independent_price() {
+        let drawing = Drawing {
+            id: 42,
+            shape: Shape::AnchoredVwap(Anchor {
+                utc_ms: 300_000,
+                price: 0.0,
+            }),
+            style: Style::default(),
+            visible: true,
+            locked: false,
+        };
+        let mut draft = Draft::from_drawing(&drawing);
+        draft.field(Field::UtcFirst, "1970-01-01T00:07:30Z".into());
+        draft.field(Field::PriceFirst, "not a price".into());
+        let (shape, _) = draft.shape_and_style().unwrap();
+        assert_eq!(
+            shape,
+            Shape::AnchoredVwap(Anchor {
+                utc_ms: 450_000,
+                price: 0.0
+            })
+        );
+        draft.field(Field::UtcFirst, "not a UTC timestamp".into());
+        assert!(draft.shape_and_style().is_err());
+        let mut controls = Controls::default();
+        controls.open_menu(&Store::new(&Market::default()));
+        assert!(matches!(
+            controls.key(
+                keyboard::Key::Character("9"),
+                keyboard::Modifiers::default(),
+                &Store::new(&Market::default())
+            ),
+            Some(Event::ChooseTool(Tool::AnchoredVwap))
+        ));
+    }
 
     #[test]
     fn empty_text_is_rejected_and_valid_draft_survives_commit_handoff() {

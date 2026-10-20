@@ -1,4 +1,4 @@
-use crate::{Message, state::Action};
+use crate::{Message, state::Action, ui, workspace::ResetKind};
 use iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, renderer,
     widget::{Operation, Tree, tree},
@@ -8,7 +8,6 @@ use iced::{Alignment, Element, Length};
 use iced::{Event, Rectangle, Renderer, Size, Theme, Vector, event, mouse};
 
 pub const LIST_SCROLL_ID: &str = "keyboard-help-list";
-const ENTRY_HEIGHT: f32 = 64.0;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Context {
@@ -26,8 +25,8 @@ struct Entry {
 }
 
 static GLOBAL_HELP: Entry = Entry {
-    keys: "F1 (all) / ? (chart)",
-    description: "Open this help",
+    keys: "F1 / ? · Ctrl+K",
+    description: "Open keyboard help / command palette",
     action: None,
 };
 
@@ -354,12 +353,32 @@ static CHART: &[Entry] = &[
         description: "Any plot: pixel scrolling pans shared time; Ctrl zooms time, Shift zooms values",
         action: None,
     },
+    Entry {
+        keys: "Ctrl+G",
+        description: "Open UTC date and time jump",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+Alt+Shift+Up / Down",
+        description: "Move active lower pane in the visible pane order",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+Alt+M",
+        description: "Maximize or restore the active pane",
+        action: None,
+    },
+    Entry {
+        keys: "8",
+        description: "Select the permanent two-anchor measurement drawing tool",
+        action: None,
+    },
 ];
 
 static DRAWINGS: &[Entry] = &[
     Entry {
         keys: "",
-        description: "Price-chart drawings · session only · shared native-instrument timeframes",
+        description: "Price-chart drawings · automatically saved · shared native-instrument timeframes",
         action: None,
     },
     Entry {
@@ -368,13 +387,38 @@ static DRAWINGS: &[Entry] = &[
         action: None,
     },
     Entry {
-        keys: "0–7 in Draw menu",
-        description: "Select / horizontal / vertical / trend / ray / rectangle / Fibonacci / text",
+        keys: "0–9 in Draw menu",
+        description: "Select / horizontal / vertical / trend / ray / rectangle / Fibonacci / text / measurement / anchored VWAP",
+        action: None,
+    },
+    Entry {
+        keys: "Draw → 9 → click / Enter",
+        description: "Anchor candle-based VWAP at a native candle; move the start handle or edit UTC; normal drawing undo/redo applies",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+P in Draw menu",
+        description: "Selected Range Volume Profile: place two time anchors; saved as a native-bound profile",
+        action: None,
+    },
+    Entry {
+        keys: "Profile range rail / Draw → PROFILE RANGES",
+        description: "Select a fixed profile; drag endpoint lines to resize or the rail to translate; Esc cancels drag",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+E / Ctrl+H / Delete (selected profile)",
+        description: "Existing profile settings / show-hide / delete; profile edits are separate from drawing-book undo",
         action: None,
     },
     Entry {
         keys: "Click anchors / arrows + Enter",
-        description: "Place each anchor; complete the drawing then return to Select",
+        description: "Place each anchor; Repeat keeps the tool armed, otherwise return to Select",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+Shift+R (Draw menu or active price drawing)",
+        description: "Toggle repeated tool creation; Escape returns to Select and disables Repeat",
         action: None,
     },
     Entry {
@@ -423,8 +467,13 @@ static DRAWINGS: &[Entry] = &[
         action: None,
     },
     Entry {
-        keys: "Ctrl+Alt+K / P (drawing properties)",
-        description: "Cycle semantic ink / stroke pattern without using the mouse",
+        keys: "Ctrl+Alt+K / P (selected drawing or properties)",
+        description: "Cycle semantic ink / stroke pattern; locked committed drawings reject styling",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+Alt+[ / ] (selected drawing)",
+        description: "Decrease / increase line width without opening properties",
         action: None,
     },
     Entry {
@@ -467,7 +516,7 @@ static INDICATORS: &[Entry] = &[
     },
     Entry {
         keys: "Ctrl+Shift+R",
-        description: "CVD: cycle Continuous / UTC day reset",
+        description: "CVD: cycle Continuous / UTC day; VWAP: UTC day/week/month/custom session",
         action: None,
     },
     Entry {
@@ -476,8 +525,18 @@ static INDICATORS: &[Entry] = &[
         action: None,
     },
     Entry {
+        keys: "Indicator chooser / Ctrl+T / Ctrl+V outside text inputs",
+        description: "Add TPO / Visible Range Volume Profile through existing native profile settings; normal parameter paste stays unchanged",
+        action: None,
+    },
+    Entry {
         keys: "Ctrl+Up / Ctrl+Down",
         description: "Select existing instance",
+        action: None,
+    },
+    Entry {
+        keys: "PageUp / PageDown",
+        description: "Scroll indicator parameters and source choices",
         action: None,
     },
     Entry {
@@ -579,6 +638,16 @@ static MARKET: &[Entry] = &[
         action: None,
     },
     Entry {
+        keys: "Ctrl+F",
+        description: "Toggle the selected exact market favorite for this session",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+Shift+Up / Down",
+        description: "Choose an exact recent/favorite market and revalidate its native catalog",
+        action: None,
+    },
+    Entry {
         keys: "Tab / Shift+Tab",
         description: "Move through selector controls",
         action: None,
@@ -628,13 +697,120 @@ static DETAILS: &[Entry] = &[
     },
 ];
 
-fn groups(context: Context) -> [&'static [Entry]; 4] {
+static PROFILES: &[Entry] = &[
+    Entry {
+        keys: "",
+        description: "TPO / Volume Profiles",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+K → profile",
+        description: "Add TPO, visible or selected-range Volume Profile; configure and manage profile IDs",
+        action: None,
+    },
+    Entry {
+        keys: "Profile settings",
+        description: "Session / fixed / visible range, ticks per row, value area and display layers",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+N / Ctrl+S",
+        description: "Profile editor: new draft / apply exact selected profile",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+Left/Right / Ctrl+Up/Down",
+        description: "Profile editor: cycle type / select exact existing instance",
+        action: None,
+    },
+    Entry {
+        keys: "Alt+Left/Right / Alt+Up/Down",
+        description: "Profile editor: cycle range mode / calendar or custom session",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+1..8",
+        description: "Toggle histogram, levels, previous, naked, Single Prints, IB, letters, poor extremes",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+9 (Volume editor)",
+        description: "Toggle automatic candle-volume fallback; apply with Ctrl+S. Estimated/Mixed never means proven execution coverage",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+P",
+        description: "Profile editor: place fixed range with two clicks or keyboard anchors",
+        action: None,
+    },
+    Entry {
+        keys: "Enter / Left / Right",
+        description: "Range tool: confirm inspected time / move the keyboard time anchor",
+        action: None,
+    },
+    Entry {
+        keys: "Esc",
+        description: "Cancel profile range placement; held drawing/chart gestures keep their owner",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+H / Ctrl+D",
+        description: "Profile editor: show/hide / remove only the selected profile ID",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+R",
+        description: "Profile editor: explicitly rebin from the available native price reference",
+        action: None,
+    },
+    Entry {
+        keys: "Ctrl+Shift+R",
+        description: "Profile editor: retry native history without clearing observed execution data",
+        action: None,
+    },
+    Entry {
+        keys: "Tab / Shift+Tab",
+        description: "Profile editor: move focus without leaking shortcuts into chart navigation",
+        action: None,
+    },
+    Entry {
+        keys: "PageUp / PageDown",
+        description: "Profile editor: scroll settings and native coverage/provenance details",
+        action: None,
+    },
+    Entry {
+        keys: "Passive graphics",
+        description: "Profiles do not change value scales; only fixed-range rails/selected handles claim input; Space-drag pans",
+        action: None,
+    },
+];
+
+/// Registry entry exposed to the command palette so keyboard-help commands stay
+/// the single source of truth for chart navigation.
+#[derive(Debug, Clone)]
+pub struct CommandEntry {
+    pub keys: &'static str,
+    pub description: &'static str,
+    pub action: Action,
+}
+
+pub fn command_entries(context: Context) -> impl Iterator<Item = CommandEntry> {
+    entries(context).filter_map(move |entry| {
+        enabled_action(context, entry).map(|action| CommandEntry {
+            keys: entry.keys,
+            description: entry.description,
+            action: action.clone(),
+        })
+    })
+}
+
+fn groups(context: Context) -> [&'static [Entry]; 5] {
     match context {
-        Context::Chart => [CHART, DRAWINGS, INDICATORS, MARKET],
-        Context::Indicators => [INDICATORS, MARKET, CHART, DRAWINGS],
-        Context::Market => [MARKET, INDICATORS, CHART, DRAWINGS],
-        Context::Details => [DETAILS, CHART, DRAWINGS, &[]],
-        Context::Drawings => [DRAWINGS, CHART, INDICATORS, MARKET],
+        Context::Chart => [CHART, DRAWINGS, INDICATORS, PROFILES, MARKET],
+        Context::Indicators => [INDICATORS, PROFILES, MARKET, CHART, DRAWINGS],
+        Context::Market => [MARKET, INDICATORS, PROFILES, CHART, DRAWINGS],
+        Context::Details => [DETAILS, PROFILES, CHART, DRAWINGS, &[]],
+        Context::Drawings => [DRAWINGS, CHART, INDICATORS, PROFILES, MARKET],
     }
 }
 
@@ -651,78 +827,130 @@ fn enabled_action(context: Context, entry: &Entry) -> Option<&Action> {
 
 pub fn view(context: Context, selected: usize) -> Element<'static, Message> {
     let mut choice = 1;
-    let mut list = column![].spacing(5);
+    let mut list = column![].spacing(3);
     for entry in entries(context) {
         if entry.keys.is_empty() {
-            list =
-                list.push(container(text(entry.description).size(15)).height(Length::Fixed(28.0)));
+            list = list.push(ui::separator()).push(
+                text(entry.description)
+                    .size(11)
+                    .style(ui::muted_text)
+                    .width(Length::Fill),
+            );
             continue;
         }
-        let label =
-            column![text(entry.keys).size(13), text(entry.description).size(12),].spacing(3);
+        let content = row![
+            container(
+                text(entry.keys)
+                    .size(10)
+                    .font(iced::Font::MONOSPACE)
+                    .width(Length::Fill)
+            )
+            .width(Length::Fixed(142.0))
+            .padding([2, 4])
+            .style(ui::card),
+            text(entry.description).size(12).width(Length::Fill),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center);
         let line: Element<'static, Message> = match enabled_action(context, entry) {
             Some(action) => {
                 let style = if selected == choice {
-                    button::primary
+                    ui::selected
                 } else {
-                    button::secondary
+                    ui::quiet
                 };
                 choice += 1;
-                button(label)
+                button(content)
                     .on_press(Message::HelpAction(action.clone()))
                     .style(style)
+                    .padding([4, 7])
                     .width(Length::Fill)
-                    .height(Length::Fixed(ENTRY_HEIGHT))
                     .into()
             }
-            None => container(label)
-                .padding([4, 8])
-                .height(Length::Fixed(ENTRY_HEIGHT))
+            None => container(content)
+                .padding([4, 7])
                 .width(Length::Fill)
                 .into(),
         };
         list = list.push(line);
     }
     let close_style = if selected == 0 {
-        button::primary
+        ui::selected
     } else {
-        button::secondary
+        ui::quiet
     };
     let panel = container(
         column![
             row![
-                text("Keyboard & mouse actions").size(20),
+                column![
+                    text(context_title(context)).size(18),
+                    text("Keyboard & mouse actions")
+                        .size(11)
+                        .style(ui::muted_text),
+                ]
+                .spacing(2),
                 iced::widget::Space::new(Length::Fill, Length::Shrink),
+                button("Commands · Ctrl+K")
+                    .on_press(Message::CommandOpen)
+                    .style(ui::quiet)
+                    .padding([5, 9]),
                 button("Close [Esc]")
                     .on_press(Message::HelpClose)
-                    .style(close_style),
+                    .style(close_style)
+                    .padding([5, 9]),
             ]
             .align_y(Alignment::Center),
-            text("Tab/Shift+Tab: select action · Enter/Space: activate · Up/Down/PageUp/PageDown: scroll")
-                .size(12),
+            row![
+                button("Clear current chart")
+                    .on_press(Message::Workspace(crate::workspace_controls::Event::Open(
+                        ResetKind::Current
+                    )))
+                    .style(ui::danger)
+                    .padding([5, 9]),
+                button("Reset everything")
+                    .on_press(Message::Workspace(crate::workspace_controls::Event::Open(
+                        ResetKind::All
+                    )))
+                    .style(ui::danger)
+                    .padding([5, 9]),
+            ]
+            .spacing(8),
+            text("Tab/Shift+Tab: select · Enter/Space: activate · Up/Down/PageUp/PageDown: scroll")
+                .size(11)
+                .style(ui::muted_text),
             text(if matches!(context, Context::Chart) {
                 "Click chart-action rows to run them. Value controls target the last active plot."
             } else {
                 "Chart actions are disabled behind dialogs. M / I rows switch editors."
             })
-                .size(12),
-            scrollable(list)
-                .id(scrollable::Id::new(LIST_SCROLL_ID))
-                .height(Length::Fill),
+            .size(11)
+            .style(ui::muted_text),
+            scrollable(container(list).padding(iced::Padding {
+                right: 16.0,
+                ..iced::Padding::default()
+            }))
+            .id(scrollable::Id::new(LIST_SCROLL_ID))
+            .height(Length::Fill),
         ]
-        .spacing(10),
+        .spacing(8),
     )
     .padding(14)
     .width(Length::Fill)
     .max_width(590)
     .height(Length::Fill)
     .max_height(650)
-    .style(container::rounded_box);
+    .style(ui::panel);
     let backdrop = scrollable(
-        mouse_area(container(iced::widget::Space::new(
-            Length::Fill,
-            Length::Fixed(1600.0),
-        )))
+        mouse_area(
+            container(iced::widget::Space::new(
+                Length::Fill,
+                Length::Fixed(1600.0),
+            ))
+            .style(|_| container::Style {
+                background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.55).into()),
+                ..container::Style::default()
+            }),
+        )
         .on_press(Message::HelpClose)
         .on_move(|_| Message::HelpBackdrop),
     )
@@ -730,7 +958,8 @@ pub fn view(context: Context, selected: usize) -> Element<'static, Message> {
     .height(Length::Fill);
     iced::widget::stack![
         backdrop,
-        container(panel)
+        container(iced::widget::opaque(panel))
+            .padding(16)
             .width(Length::Fill)
             .height(Length::Fill)
             .align_x(Alignment::Center)
@@ -739,15 +968,41 @@ pub fn view(context: Context, selected: usize) -> Element<'static, Message> {
     .into()
 }
 
+fn context_title(context: Context) -> &'static str {
+    match context {
+        Context::Chart => "Chart",
+        Context::Drawings => "Drawings",
+        Context::Indicators => "Indicators",
+        Context::Market => "Market",
+        Context::Details => "Details",
+    }
+}
+
 /// Keep background widget state mounted, but block input and existing dropdown
 /// overlays while a foreground dialog owns the window.
 pub fn modal_background<'a>(content: Element<'a, Message>, blocked: bool) -> Element<'a, Message> {
-    Element::new(ModalBackground { content, blocked })
+    Element::new(ModalBackground {
+        content,
+        blocked,
+        profile_shortcuts: false,
+    })
+}
+
+/// Numbered profile commands belong to the editor, not its focused text input.
+/// iced 0.13 inserts KeyPressed.text for Ctrl+digits; the global command listener
+/// still receives the captured key and applies the option exactly once.
+pub fn profile_shortcuts<'a>(content: Element<'a, Message>) -> Element<'a, Message> {
+    Element::new(ModalBackground {
+        content,
+        blocked: false,
+        profile_shortcuts: true,
+    })
 }
 
 struct ModalBackground<'a> {
     content: Element<'a, Message>,
     blocked: bool,
+    profile_shortcuts: bool,
 }
 
 impl Widget<Message, Theme, Renderer> for ModalBackground<'_> {
@@ -825,6 +1080,19 @@ impl Widget<Message, Theme, Renderer> for ModalBackground<'_> {
         if self.blocked && !matches!(event, Event::Window(_)) {
             return event::Status::Captured;
         }
+        if self.profile_shortcuts
+            && let Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) =
+                &event
+            && modifiers.control()
+            && !modifiers.alt()
+            && !modifiers.logo()
+            && matches!(
+                key.as_ref(),
+                iced::keyboard::Key::Character("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            )
+        {
+            return event::Status::Captured;
+        }
         self.content.as_widget_mut().on_event(
             tree, event, layout, cursor, renderer, clipboard, shell, viewport,
         )
@@ -886,11 +1154,14 @@ pub fn action_scroll_offset(context: Context, index: usize) -> Option<f32> {
             }
             action_index += 1;
         }
-        offset += (if entry.keys.is_empty() {
-            28.0
+        let row_height = if entry.keys.is_empty() {
+            20.0
         } else {
-            ENTRY_HEIGHT
-        }) + 5.0;
+            let key_lines = entry.keys.len().div_ceil(22).max(1) as f32;
+            let description_lines = entry.description.len().div_ceil(42).max(1) as f32;
+            (key_lines * 12.0).max(description_lines * 14.0) + 16.0
+        };
+        offset += row_height + 3.0;
     }
     None
 }

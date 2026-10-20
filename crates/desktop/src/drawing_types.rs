@@ -64,10 +64,12 @@ pub enum Tool {
     Rectangle,
     Fibonacci,
     Text,
+    Measure,
+    AnchoredVwap,
 }
 
 impl Tool {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::Select,
         Self::Horizontal,
         Self::Vertical,
@@ -76,12 +78,14 @@ impl Tool {
         Self::Rectangle,
         Self::Fibonacci,
         Self::Text,
+        Self::Measure,
+        Self::AnchoredVwap,
     ];
     pub fn anchors_required(self) -> usize {
         match self {
             Self::Select => 0,
-            Self::Horizontal | Self::Vertical | Self::Text => 1,
-            Self::Trend | Self::Ray | Self::Rectangle | Self::Fibonacci => 2,
+            Self::Horizontal | Self::Vertical | Self::Text | Self::AnchoredVwap => 1,
+            Self::Trend | Self::Ray | Self::Rectangle | Self::Fibonacci | Self::Measure => 2,
         }
     }
 }
@@ -97,6 +101,8 @@ impl fmt::Display for Tool {
             Self::Rectangle => "Rectangle / zone",
             Self::Fibonacci => "Fibonacci retracement",
             Self::Text => "Text annotation",
+            Self::Measure => "Measure",
+            Self::AnchoredVwap => "Anchored VWAP",
         })
     }
 }
@@ -170,6 +176,7 @@ pub enum Shape {
     Trend(Anchor, Anchor),
     Ray(Anchor, Anchor),
     Rectangle(Anchor, Anchor),
+    Measure(Anchor, Anchor),
     Fibonacci {
         a: Anchor,
         b: Anchor,
@@ -181,6 +188,7 @@ pub enum Shape {
         at: Anchor,
         text: String,
     },
+    AnchoredVwap(Anchor),
 }
 
 impl Shape {
@@ -191,16 +199,22 @@ impl Shape {
             Self::Trend(_, _) => Tool::Trend,
             Self::Ray(_, _) => Tool::Ray,
             Self::Rectangle(_, _) => Tool::Rectangle,
+            Self::Measure(_, _) => Tool::Measure,
             Self::Fibonacci { .. } => Tool::Fibonacci,
             Self::Text { .. } => Tool::Text,
+            Self::AnchoredVwap(_) => Tool::AnchoredVwap,
         }
     }
     pub fn anchors(&self) -> Anchors {
         match self {
-            Self::Horizontal(a) | Self::Vertical(a) | Self::Text { at: a, .. } => Anchors::One(*a),
+            Self::Horizontal(a)
+            | Self::Vertical(a)
+            | Self::AnchoredVwap(a)
+            | Self::Text { at: a, .. } => Anchors::One(*a),
             Self::Trend(a, b)
             | Self::Ray(a, b)
             | Self::Rectangle(a, b)
+            | Self::Measure(a, b)
             | Self::Fibonacci { a, b, .. } => Anchors::Two(*a, *b),
         }
     }
@@ -215,11 +229,18 @@ pub struct Drawing {
     pub locked: bool,
 }
 
+impl Drawing {
+    pub fn can_drag(&self, part: Part) -> bool {
+        !self.locked && !(self.shape.tool() == Tool::AnchoredVwap && part == Part::Body)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Command {
     Create { shape: Shape, style: Style },
     Replace(Drawing),
     Move { id: DrawingId, anchors: Anchors },
+    Style { id: DrawingId, style: Style },
     Delete(DrawingId),
     SetVisible { id: DrawingId, visible: bool },
     SetLocked { id: DrawingId, locked: bool },

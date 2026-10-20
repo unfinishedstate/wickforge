@@ -23,6 +23,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::{flow, get_json, history_end, history_page, integer, number, unix_seconds, validate};
 
+mod executions;
+pub use executions::{execution_history, execution_session};
+
 const SPOT_REST: &str = "https://api.mexc.com/api/v3";
 const FUTURES_REST: &str = "https://api.mexc.com/api/v1/contract";
 const FUTURES_WS: &str = "wss://contract.mexc.com/edge";
@@ -126,6 +129,8 @@ struct FuturesInstrument {
     quote_coin: String,
     settle_coin: String,
     price_scale: u32,
+    #[serde(default)]
+    price_unit: Value,
     contract_size: Decimal,
     state: i64,
     #[serde(default)]
@@ -186,6 +191,8 @@ pub async fn catalog(client: &reqwest::Client, product: Product) -> Result<Catal
                     quote_coin,
                     settle_coin: item.quote_asset.clone(),
                     price_scale: item.quote_asset_precision,
+                    // quotePrecision is documented as precision, not a native tick.
+                    tick_size: None,
                     contract_size: 1.0,
                     inverse: false,
                     volume_unit: item.base_asset,
@@ -232,6 +239,7 @@ pub async fn catalog(client: &reqwest::Client, product: Product) -> Result<Catal
                     quote_coin,
                     settle_coin: item.settle_coin,
                     price_scale: item.price_scale,
+                    tick_size: executions::native_tick(&item.price_unit),
                     contract_size: item.contract_size.0,
                     inverse,
                     volume_unit: "contracts".to_owned(),
@@ -1180,6 +1188,7 @@ async fn stream_futures(
         let mut connection_shutdown = shutdown.clone();
         let result = stream_futures_connection(
             client,
+            instrument,
             market,
             cvd,
             sender,
@@ -1223,8 +1232,10 @@ async fn stream_futures(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_futures_connection(
     client: &reqwest::Client,
+    instrument: &Instrument,
     market: &Market,
     cvd: bool,
     sender: &mpsc::Sender<MarketEvent>,
@@ -1235,6 +1246,7 @@ async fn stream_futures_connection(
     if *shutdown.borrow() {
         return Ok(());
     }
+    let mut execution_producer = None;
     let (socket, _) = connect_async(FUTURES_WS)
         .await
         .context("connecting MEXC futures websocket")?;
@@ -1269,7 +1281,10 @@ async fn stream_futures_connection(
             }
         };
         if let Some(rows) = rows {
+            execution_producer
+                .get_or_insert_with(|| crate::executions::native_producer(instrument));
             for deal in rows {
+                executions::observe_futures(instrument, &deal);
                 let Some(id) = deal.get("i").and_then(native_id) else {
                     capture.invalidate(step, sender).await?;
                     recent_ids.clear();
@@ -1318,8 +1333,10 @@ async fn stream_futures_connection(
                     let val: Value = serde_json::from_str(&text).context("invalid MEXC futures JSON")?;
                     if cvd && val.get("channel").and_then(Value::as_str) == Some("push.deal") {
                         if val.get("symbol").and_then(Value::as_str) != Some(market.symbol.as_str()) { continue; }
+                        execution_producer.get_or_insert_with(|| crate::executions::native_producer(instrument));
                         if let Some(deals) = val.get("data").and_then(Value::as_array) {
                             for deal in deals {
+                                executions::observe_futures(instrument, deal);
                                 let id = deal.get("i").and_then(native_id);
                                 if id.as_ref().is_some_and(|id| !recent_ids.insert(id)) { continue; }
                                 if !flow_connection_confirmed {
@@ -1459,6 +1476,7 @@ async fn stream_spot_flow_connection(
     mut shutdown: watch::Receiver<bool>,
     recent_ids: &mut RecentTradeIds,
 ) -> Result<()> {
+    let mut execution_producer = None;
     let (socket, _) = connect_async("wss://wbs-api.mexc.com/ws")
         .await
         .context("connecting MEXC spot trade websocket")?;
@@ -1520,7 +1538,9 @@ async fn stream_spot_flow_connection(
                     let wrapper = PbWrapper::decode(bytes.as_ref()).context("decoding official MEXC spot protobuf envelope")?;
                     if wrapper.symbol.as_deref().is_some_and(|s| s != instrument.symbol) { continue; }
                     let Some(pb_wrapper::Body::AggDeals(deals)) = wrapper.body else { continue; };
+                    execution_producer.get_or_insert_with(|| crate::executions::native_producer(instrument));
                     for deal in deals.deals {
+                        executions::observe_spot(instrument, &deal);
                         let has_id = !deal.trade_id.is_empty();
                         if has_id && !recent_ids.insert(&deal.trade_id) { continue; }
                         if !reported_connected {

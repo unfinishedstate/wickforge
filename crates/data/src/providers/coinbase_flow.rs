@@ -97,11 +97,23 @@ pub(super) async fn record_price_observation(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Trade {
-    id: u64,
-    time_ms: i64,
-    size: Decimal,
+pub(super) struct Trade {
+    pub(super) id: u64,
+    pub(super) time_ms: i64,
+    pub(super) size: Decimal,
+    pub(super) price: Decimal,
     maker_side: MakerSide,
+}
+
+impl Trade {
+    pub(super) fn execution(&self) -> mexc_model::executions::Execution {
+        mexc_model::executions::Execution {
+            time_ms: self.time_ms,
+            id: format!("raw:{}", self.id),
+            price: self.price,
+            quantity: self.size,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,10 +155,10 @@ impl Totals {
 }
 
 #[derive(Debug)]
-struct TradePage {
-    trades: Vec<Trade>,
-    after: Option<String>,
-    before: Option<String>,
+pub(super) struct TradePage {
+    pub(super) trades: Vec<Trade>,
+    pub(super) after: Option<String>,
+    pub(super) before: Option<String>,
 }
 
 #[derive(Default)]
@@ -224,6 +236,14 @@ fn parse_trade(value: &Value) -> Result<Trade> {
             .and_then(Value::as_str)
             .context("Coinbase trade has no native size")?,
     )?;
+    let price = Decimal::from_str_exact(
+        value
+            .get("price")
+            .and_then(Value::as_str)
+            .context("Coinbase trade has no native price")?,
+    )
+    .context("invalid Coinbase native trade price")?;
+    ensure!(price > Decimal::ZERO, "nonpositive Coinbase trade price");
     let maker_side = parse_side(
         value
             .get("side")
@@ -234,6 +254,7 @@ fn parse_trade(value: &Value) -> Result<Trade> {
         id,
         time_ms,
         size,
+        price,
         maker_side,
     })
 }
@@ -260,7 +281,7 @@ fn cursor_header(headers: &HeaderMap, name: &'static str) -> Result<Option<Strin
         .transpose()
 }
 
-async fn get_trade_page(
+pub(super) async fn get_trade_page(
     client: &Client,
     symbol: &str,
     cursor_name: Option<&'static str>,
@@ -330,7 +351,7 @@ async fn history_page(
 
 async fn live_page(
     client: &Client,
-    symbol: &str,
+    instrument: &Instrument,
     query: (Option<&'static str>, Option<&str>, usize),
     pacer: &mut Pacer,
     inbox: (
@@ -343,7 +364,7 @@ async fn live_page(
     let (cursor_name, cursor, limit) = query;
     let (receiver, buffered) = inbox;
     pacer.wait_live(shutdown).await?;
-    let request = get_trade_page(client, symbol, cursor_name, cursor, limit);
+    let request = get_trade_page(client, &instrument.symbol, cursor_name, cursor, limit);
     tokio::pin!(request);
     loop {
         tokio::select! {
@@ -353,11 +374,27 @@ async fn live_page(
                     bail!("Coinbase live flow stopped");
                 }
             }
-            result = &mut request => return result,
+            result = &mut request => {
+                let page = result?;
+                if let (Some(newest), Some(oldest)) = (page.trades.first(), page.trades.last()) {
+                    let end_ms = newest.time_ms.saturating_add(1);
+                    crate::executions::observe_page(instrument, mexc_model::executions::ExecutionPage {
+                        executions: page.trades.iter().map(Trade::execution).collect(),
+                        coverage: vec![mexc_model::executions::Coverage {
+                            start_ms: oldest.time_ms,
+                            end_ms,
+                            complete: false,
+                            reason: Some("Native Coinbase replay page; interval proof awaits complete cursor/heartbeat reconciliation".into()),
+                        }],
+                        observed_through_ms: end_ms,
+                    });
+                }
+                return Ok(page);
+            },
             message = receiver.recv() => {
                 let message = message.context("Coinbase WebSocket reader ended during REST reconciliation")?;
                 let message = message.map_err(anyhow::Error::msg)?;
-                if let Some(message) = parse_live_message(message, symbol)? {
+                if let Some(message) = parse_shared_live_message(message, instrument)? {
                     buffered.push(message);
                 }
             }
@@ -783,12 +820,12 @@ async fn emit_missing_history(
 }
 
 #[derive(Clone, Debug)]
-enum LiveMessage {
+pub(super) enum LiveMessage {
     Trade(Trade),
     Heartbeat { last_trade_id: u64, time_ms: i64 },
 }
 
-fn parse_live_message(message: Message, symbol: &str) -> Result<Option<LiveMessage>> {
+pub(super) fn parse_live_message(message: Message, symbol: &str) -> Result<Option<LiveMessage>> {
     let text = match message {
         Message::Text(text) => text.to_string(),
         Message::Binary(bytes) => {
@@ -834,6 +871,48 @@ fn parse_live_message(message: Message, symbol: &str) -> Result<Option<LiveMessa
     }
 }
 
+fn parse_shared_live_message(
+    message: Message,
+    instrument: &Instrument,
+) -> Result<Option<LiveMessage>> {
+    let parsed = parse_live_message(message, &instrument.symbol)?;
+    if let Some(LiveMessage::Trade(trade)) = &parsed {
+        crate::executions::observe(instrument, trade.execution());
+    }
+    Ok(parsed)
+}
+
+fn observe_verified_executions(instrument: &Instrument, start_ms: i64, end_ms: i64) {
+    if start_ms < end_ms {
+        crate::executions::observe_page(
+            instrument,
+            mexc_model::executions::ExecutionPage {
+                executions: Vec::new(),
+                coverage: vec![mexc_model::executions::Coverage {
+                    start_ms,
+                    end_ms,
+                    complete: true,
+                    reason: None,
+                }],
+                observed_through_ms: end_ms,
+            },
+        );
+    }
+}
+
+/// A left-edge timestamp is proof only if every descending native ID was seen,
+/// including the transition between REST pages.
+fn observe_startup_ids(previous: &mut Option<u64>, contiguous: &mut bool, trades: &[Trade]) {
+    for trade in trades {
+        if let Some(id) = *previous {
+            if trade.id >= id {
+                continue;
+            }
+            *contiguous &= trade.id.checked_add(1) == Some(id);
+        }
+        *previous = Some(trade.id);
+    }
+}
 fn merge_live_trades(after_id: Option<u64>, mut trades: Vec<Trade>) -> Result<Vec<Trade>> {
     trades.retain(|trade| after_id.is_none_or(|last| trade.id > last));
     trades.sort_by_key(|trade| trade.id);
@@ -856,6 +935,11 @@ fn merge_live_trades(after_id: Option<u64>, mut trades: Vec<Trade>) -> Result<Ve
                 "Coinbase live trade time regressed by ID"
             );
         }
+        let previous_id = merged.last().map(|previous| previous.id).or(after_id);
+        ensure!(
+            previous_id.is_none_or(|previous| previous.checked_add(1) == Some(trade.id)),
+            "Coinbase live trade IDs contain an unrecovered gap"
+        );
         merged.push(trade);
     }
     Ok(merged)
@@ -1096,7 +1180,7 @@ async fn emit_invalidated(
     Ok(())
 }
 
-async fn reader_task(
+pub(super) async fn reader_task(
     stream: SocketStream,
     sender: mpsc::Sender<std::result::Result<Message, String>>,
 ) {
@@ -1127,6 +1211,7 @@ async fn live_session(
     let active_bucket = now_ms.div_euclid(width * 1_000) * width;
     let prior_seen_id = state.last_seen_id;
     let prior_seen_ms = state.last_seen_ms;
+    let prior_verified_ms = state.verified_ms;
     sender
         .send(MarketEvent::FlowStatus {
             connected: false,
@@ -1161,6 +1246,7 @@ async fn live_session(
         ))
         .await
         .context("subscribing to Coinbase matches and heartbeat")?;
+        let _producer = crate::executions::native_producer(instrument);
         sender
             .send(MarketEvent::FlowStatus {
                 connected: false,
@@ -1177,10 +1263,12 @@ async fn live_session(
         let mut newest: Option<Trade> = None;
         let mut rest_through_ms = now_ms;
         let mut edge_complete = false;
+        let mut startup_previous = None;
+        let mut startup_contiguous = true;
         loop {
             let page = live_page(
                 client,
-                &instrument.symbol,
+                instrument,
                 (if first { None } else { Some("after") }, cursor.as_deref(), TRADE_LIMIT),
                 pacer,
                 (&mut reader_rx, &mut buffered),
@@ -1196,6 +1284,7 @@ async fn live_session(
                 newest = page.trades.first().cloned();
                 rest_through_ms = newest.as_ref().map_or(now_ms, |trade| trade.time_ms);
             }
+            observe_startup_ids(&mut startup_previous, &mut startup_contiguous, &page.trades);
             consume_page(
                 &page.trades,
                 &mut oldest_id,
@@ -1205,7 +1294,8 @@ async fn live_session(
                 width,
                 &mut totals,
             )?;
-            edge_complete = oldest_time.is_some_and(|time| time < active_bucket.saturating_mul(1_000));
+            edge_complete = startup_contiguous
+                && oldest_time.is_some_and(|time| time < active_bucket.saturating_mul(1_000));
             if edge_complete || page.trades.len() < TRADE_LIMIT {
                 break;
             }
@@ -1235,7 +1325,7 @@ async fn live_session(
         let mut catchup_trades = if target_id > from_id {
             catch_up_to_heartbeat(
                 client,
-                &instrument.symbol,
+                instrument,
                 (from_id, target_id),
                 pacer,
                 (&mut reader_rx, &mut buffered),
@@ -1263,7 +1353,7 @@ async fn live_session(
             }
             state.coverage.retain(|bucket, _| *bucket < active_bucket);
             for bucket in totals.keys() {
-                let left_proven = oldest_time.is_some_and(|time| time < bucket.saturating_mul(1_000));
+                let left_proven = startup_contiguous && oldest_time.is_some_and(|time| time < bucket.saturating_mul(1_000));
                 state.coverage.insert(*bucket, left_proven);
             }
         }
@@ -1280,7 +1370,7 @@ async fn live_session(
                 continue;
             }
             state.buckets.entry(bucket).or_default().add(trade)?;
-            let left_proven = oldest_time.is_some_and(|time| time < bucket.saturating_mul(1_000));
+            let left_proven = startup_contiguous && oldest_time.is_some_and(|time| time < bucket.saturating_mul(1_000));
             let recovered_after_open = prior_bucket.is_some_and(|previous| bucket > previous);
             state.coverage
                 .entry(bucket)
@@ -1323,6 +1413,14 @@ async fn live_session(
         buffered.clear();
         let through = state.verified_ms.unwrap_or(rest_through_ms);
         emit_verified(sender, state, price_coverage, through, width).await?;
+        let replay_proven = prior_seen_id.is_some_and(|from| {
+            target_id.checked_sub(from) == u64::try_from(merged.len()).ok()
+        });
+        if let Some(from_ms) = prior_verified_ms.filter(|_| replay_proven)
+            .or_else(|| edge_complete.then_some(active_bucket.saturating_mul(1_000)))
+        {
+            observe_verified_executions(instrument, from_ms, through);
+        }
 
         sender
             .send(MarketEvent::FlowStatus {
@@ -1350,16 +1448,17 @@ async fn live_session(
                 item = reader_rx.recv() => {
                     let item = item.context("Coinbase WebSocket reader ended")?;
                     let item = item.map_err(anyhow::Error::msg)?;
-                    let Some(message) = parse_live_message(item, &instrument.symbol)? else { continue; };
+                    let Some(message) = parse_shared_live_message(item, instrument)? else { continue; };
                     match message {
                         LiveMessage::Trade(trade) => buffered.push(LiveMessage::Trade(trade)),
                         LiveMessage::Heartbeat { last_trade_id, time_ms } => {
                             let previous_seen = state.last_seen_id;
                             let previous_seen_ms = state.last_seen_ms;
+                            let previous_verified_ms = state.verified_ms;
                             let mut recovered = if previous_seen.is_some_and(|from| last_trade_id > from) {
                                 catch_up_to_heartbeat(
                                     client,
-                                    &instrument.symbol,
+                                    instrument,
                                     (previous_seen.unwrap(), last_trade_id),
                                     pacer,
                                     (&mut reader_rx, &mut buffered),
@@ -1414,6 +1513,17 @@ async fn live_session(
                             state.capture_contiguous = true;
                             state.verified_ms = Some(through);
                             emit_verified(sender, state, price_coverage, through, width).await?;
+                            if let Some(from_ms) = previous_verified_ms {
+                                let complete = previous_seen.is_some_and(|from| {
+                                    last_trade_id.checked_sub(from) == u64::try_from(merged.len()).ok()
+                                });
+                                if complete {
+                                    observe_verified_executions(instrument, from_ms, through);
+                                } else {
+                                    crate::executions::observe_gap(instrument, from_ms, through,
+                                        "Coinbase heartbeat replay has native trade-ID holes; completeness is unproved");
+                                }
+                            }
                             sender.send(MarketEvent::FlowStatus {
                                 connected: true,
                                 message: "Coinbase heartbeat REST reconciliation complete; absolute flow snapshots are current".into(),
@@ -1429,7 +1539,7 @@ async fn live_session(
 
 async fn catch_up_to_heartbeat(
     client: &Client,
-    symbol: &str,
+    instrument: &Instrument,
     ids: (u64, u64),
     pacer: &mut Pacer,
     inbox: (
@@ -1447,7 +1557,7 @@ async fn catch_up_to_heartbeat(
     loop {
         let page = live_page(
             client,
-            symbol,
+            instrument,
             (Some("before"), Some(&cursor), TRADE_LIMIT),
             pacer,
             (&mut *receiver, &mut *buffered),
@@ -1518,6 +1628,12 @@ async fn live_flow_loop(
                     return Ok(());
                 }
                 let now = flow::unix_millis();
+                crate::executions::observe_gap(
+                    instrument,
+                    state.verified_ms.or(state.last_seen_ms).unwrap_or(now),
+                    now.saturating_add(1),
+                    format!("Coinbase native matches/heartbeat interrupted: {error:#}"),
+                );
                 emit_invalidated(sender, &mut state, now, market.interval.seconds()).await?;
                 sender
                     .send(MarketEvent::FlowStatus {
@@ -1576,8 +1692,67 @@ mod tests {
             id,
             time_ms,
             size: flow::amount(size).unwrap(),
+            price: Decimal::new(12345, 2),
             maker_side: side,
         }
+    }
+
+    #[test]
+    fn startup_left_edge_requires_contiguous_ids_within_and_across_pages() {
+        for pages in [
+            vec![vec![103, 101, 100]],
+            vec![vec![103], vec![101, 100]],
+            vec![vec![103, 102], vec![101, 100]],
+        ] {
+            let expected = pages.iter().map(Vec::len).sum::<usize>() == 4;
+            let mut previous = None;
+            let mut contiguous = true;
+            let mut oldest_id = None;
+            let mut oldest_time = None;
+            let mut totals = BTreeMap::new();
+            for ids in pages {
+                let rows: Vec<_> = ids
+                    .into_iter()
+                    .map(|id| {
+                        trade(
+                            id,
+                            if id == 100 { 999 } else { 1_001 },
+                            MakerSide::Sell,
+                            "1",
+                        )
+                    })
+                    .collect();
+                observe_startup_ids(&mut previous, &mut contiguous, &rows);
+                consume_page(
+                    &rows,
+                    &mut oldest_id,
+                    &mut oldest_time,
+                    1_000,
+                    i64::MAX,
+                    1,
+                    &mut totals,
+                )
+                .unwrap();
+            }
+            assert!(oldest_time.unwrap() < 1_000);
+            assert_eq!(contiguous && oldest_time.unwrap() < 1_000, expected);
+            assert_eq!(totals[&1].buy, Decimal::from(if expected { 3 } else { 2 }));
+        }
+        assert!(
+            merge_live_trades(Some(103), vec![trade(105, 2_000, MakerSide::Sell, "1"),]).is_err()
+        );
+        assert_eq!(
+            merge_live_trades(
+                Some(103),
+                vec![
+                    trade(105, 2_000, MakerSide::Sell, "1"),
+                    trade(104, 1_500, MakerSide::Sell, "1"),
+                ]
+            )
+            .unwrap()
+            .len(),
+            2
+        );
     }
 
     #[test]
@@ -1699,5 +1874,42 @@ mod tests {
         record_price_observation_inner(&mut coverage, &[], 120, 180_000, 60);
         assert_eq!(coverage.observed_from_seconds, Some(120));
         assert_eq!(coverage.observed_through_ms, 180_000);
+    }
+
+    #[test]
+    fn native_price_and_size_survive_rest_and_live_parsing_without_float_rounding() {
+        let value = json!({
+            "trade_id": "9007199254740993",
+            "time": "2026-01-01T00:00:00.123999Z",
+            "price": "1000000000000000.00000001",
+            "size": "0.000000000123456789",
+            "side": "sell",
+            "type": "match",
+            "product_id": "BTC-USD"
+        });
+        let rest = parse_trade(&value).unwrap();
+        let Some(LiveMessage::Trade(live)) =
+            parse_live_message(Message::Text(value.to_string().into()), "BTC-USD").unwrap()
+        else {
+            panic!("expected native match");
+        };
+        assert_eq!(rest, live);
+        let execution = rest.execution();
+        assert_eq!(execution.id, "raw:9007199254740993");
+        assert_eq!(execution.price.to_string(), "1000000000000000.00000001");
+        assert_eq!(execution.quantity.to_string(), "0.000000000123456789");
+        assert_eq!(execution.time_ms.rem_euclid(1_000), 123);
+        let mut totals = Totals::default();
+        totals.add(&rest).unwrap();
+        assert_eq!(totals.buy, rest.size);
+        assert_eq!(totals.sell, Decimal::ZERO);
+    }
+
+    #[test]
+    fn conflicting_native_prices_are_not_deduplicated_as_identical_trades() {
+        let first = trade(12, 1_000, MakerSide::Sell, "0.125");
+        let mut changed = first.clone();
+        changed.price += Decimal::new(1, 8);
+        assert!(merge_live_trades(None, vec![first, changed]).is_err());
     }
 }

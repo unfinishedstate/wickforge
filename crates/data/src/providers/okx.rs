@@ -27,6 +27,10 @@ use super::{
     flow, flow_support, get_json, history_end, history_page, integer, number, unix_seconds,
 };
 
+#[path = "okx_executions.rs"]
+mod executions;
+pub use executions::{execution_history, execution_session};
+
 const REST: &str = "https://www.okx.com/api/v5";
 const WS: &str = "wss://ws.okx.com:443/ws/v5/business";
 
@@ -181,6 +185,12 @@ pub async fn catalog(client: &Client, product: Product) -> Result<Catalog> {
             quote_coin,
             settle_coin,
             price_scale,
+            tick_size: Some(flow::amount(
+                item.get("tickSz")
+                    .and_then(Value::as_str)
+                    .context("OKX instrument missing tickSz")?,
+            )?)
+            .filter(|tick| *tick > Decimal::ZERO),
             contract_size,
             inverse,
             volume_unit,
@@ -1002,6 +1012,8 @@ pub async fn stream(
         return Ok(());
     }
     let quantities = FlowQuantities::new(instrument, quantity)?;
+    // Candle-only sockets must not suppress the standalone native tape.
+    let mut execution_producer = None;
     let (socket, _) = tokio::select! {
         changed = shutdown.changed() => { let _ = changed; return Ok(()); }
         result = connect_async(WS) => result.context("connecting to OKX business WebSocket")?,
@@ -1049,6 +1061,7 @@ pub async fn stream(
                                 sender.send(MarketEvent::Status { connected: true, message: "Connected to OKX candle WebSocket".into() }).await?;
                             }
                             if cvd && value.pointer("/arg/channel").and_then(Value::as_str) == Some("trades-all") {
+                                execution_producer.get_or_insert_with(|| crate::executions::native_producer(instrument));
                                 flow_ready_at = Some(flow::unix_millis().saturating_add(1_000));
                                 sender.send(MarketEvent::FlowStatus { connected: true, message:format!("OKX trades-all acknowledged; forming-bar flow starts only in buckets opening after subscription is established. Closed bars require REST/raw-ID reconciliation. {}", quantity_message(instrument, quantity)) }).await?;
                             }
@@ -1062,7 +1075,17 @@ pub async fn stream(
                         }
                         if channel == "trades-all" {
                             if !cvd { continue; }
+                            execution_producer.get_or_insert_with(|| crate::executions::native_producer(instrument));
                             for row in rows {
+                                // Observe raw priced data before CVD dedup, conversion or side handling.
+                                // In particular, an unknown side must not discard profile volume.
+                                match executions::parse_trade(row) {
+                                    Ok(execution) => crate::executions::observe(instrument, execution),
+                                    Err(error) => {
+                                        let time_ms = row.get("ts").and_then(Value::as_str).and_then(|value| value.parse::<i64>().ok()).filter(|time| *time >= 0).unwrap_or_else(flow::unix_millis);
+                                        crate::executions::observe_gap(instrument, time_ms, time_ms.saturating_add(1), format!("Invalid OKX trades-all execution: {error}"));
+                                    }
+                                }
                                 let id = row.get("tradeId").and_then(Value::as_str).context("OKX live trade lacks tradeId")?.parse::<u64>().context("OKX trade ID is not an unsigned integer")?;
                                 let id_result = remember_live_id(id, &mut last_live_trade_id, &mut recent_live_ids, &mut recent_live_order);
                                 if id_result == LiveIdResult::Duplicate { continue; }
@@ -1177,6 +1200,7 @@ mod tests {
             quote_coin: Quote::parse("USDT").unwrap(),
             settle_coin: "USDT".into(),
             price_scale: 1,
+            tick_size: None,
             contract_size: 1.0,
             inverse: false,
             volume_unit: "BTC".into(),

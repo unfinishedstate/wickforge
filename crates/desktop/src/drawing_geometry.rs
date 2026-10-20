@@ -221,6 +221,7 @@ struct ShapeView<'a> {
     reverse: bool,
     extend_right: bool,
     text: Option<&'a str>,
+    vwap: Option<&'a crate::drawings::AnchoredVwap>,
 }
 impl<'a> ShapeView<'a> {
     fn drawing(drawing: &'a Drawing, anchors: Anchors) -> Self {
@@ -241,6 +242,7 @@ impl<'a> ShapeView<'a> {
             reverse,
             extend_right,
             text,
+            vwap: None,
         }
     }
     fn create(tool: Tool, anchors: Anchors) -> Self {
@@ -251,7 +253,26 @@ impl<'a> ShapeView<'a> {
             reverse: false,
             extend_right: true,
             text: None,
+            vwap: None,
         }
+    }
+
+    fn cached(
+        drawing: &'a Drawing,
+        anchors: Anchors,
+        store: Option<&'a crate::drawings::Store>,
+    ) -> Self {
+        let mut view = Self::drawing(drawing, anchors);
+        if matches!(drawing.shape, Shape::AnchoredVwap(_)) {
+            view.vwap = store.and_then(|store| store.vwap(drawing.id));
+            if let Some(start) = view.vwap.and_then(crate::drawings::AnchoredVwap::start) {
+                view.anchors = Anchors::One(Anchor {
+                    price: start.price,
+                    ..anchors.first()
+                });
+            }
+        }
+        view
     }
 }
 
@@ -283,6 +304,14 @@ fn corners(anchors: Anchors) -> Option<[Anchor; 4]> {
 }
 
 fn visit_handles(view: ShapeView<'_>, projection: Projection, mut visit: impl FnMut(Point, Part)) {
+    if view.tool == Tool::AnchoredVwap
+        && view
+            .vwap
+            .and_then(crate::drawings::AnchoredVwap::start)
+            .is_none()
+    {
+        return;
+    }
     if view.tool == Tool::Rectangle {
         if let Some(corners) = corners(view.anchors) {
             for (index, anchor) in corners.into_iter().enumerate() {
@@ -324,18 +353,29 @@ fn handle_hit(view: ShapeView<'_>, projection: Projection, point: Point) -> Opti
     nearest
 }
 
+#[cfg(test)]
 pub fn hit_test(
     objects: &[Drawing],
     selected: Option<DrawingId>,
     projection: Projection,
     point: Point,
 ) -> Option<Hit> {
+    hit_test_cached(objects, selected, projection, point, None)
+}
+
+pub fn hit_test_cached(
+    objects: &[Drawing],
+    selected: Option<DrawingId>,
+    projection: Projection,
+    point: Point,
+    store: Option<&crate::drawings::Store>,
+) -> Option<Hit> {
     if !projection.contains(point) {
         return None;
     }
     if let Some(drawing) = selected.and_then(|id| objects.iter().find(|d| d.id == id && d.visible))
     {
-        let view = ShapeView::drawing(drawing, drawing.shape.anchors());
+        let view = ShapeView::cached(drawing, drawing.shape.anchors(), store);
         if let Some(text) = view.text {
             pin_text_layout(text, font_size(drawing.style));
         }
@@ -347,7 +387,7 @@ pub fn hit_test(
         }
     }
     for drawing in objects.iter().rev().filter(|d| d.visible) {
-        let view = ShapeView::drawing(drawing, drawing.shape.anchors());
+        let view = ShapeView::cached(drawing, drawing.shape.anchors(), store);
         if body_hit(view, drawing.style, projection, point) {
             if selected.is_none()
                 && let Some(text) = view.text
@@ -378,6 +418,37 @@ fn segment_distance(point: Point, a: Point, b: Point) -> f32 {
 }
 
 fn visit_lines(view: ShapeView<'_>, projection: Projection, mut visit: impl FnMut(Point, Point)) {
+    if view.tool == Tool::AnchoredVwap {
+        if let Some(cache) = view.vwap {
+            let start = cache
+                .points
+                .partition_point(|point| (point.time as f64) < projection.left)
+                .saturating_sub(1);
+            let end = cache
+                .points
+                .partition_point(|point| point.time as f64 <= projection.left + projection.span)
+                .saturating_add(1);
+            let mut previous: Option<(DataPoint, i64)> = None;
+            for point in &cache.points[start..end.min(cache.points.len())] {
+                let Some(price) = point.values[0] else {
+                    previous = None;
+                    continue;
+                };
+                let next = DataPoint {
+                    x: point.time as f64,
+                    y: price,
+                };
+                if let Some((previous_point, time)) = previous
+                    && point.time.saturating_sub(time).saturating_mul(1000) == cache.step_ms
+                    && let Some((a, b)) = clip_line(projection, previous_point, next, false)
+                {
+                    visit(a, b);
+                }
+                previous = Some((next, point.time));
+            }
+        }
+        return;
+    }
     let a = DataPoint::from(view.anchors.first());
     let b = view.anchors.second().map(DataPoint::from);
     let mut line = |a, b, ray| {
@@ -408,7 +479,7 @@ fn visit_lines(view: ShapeView<'_>, projection: Projection, mut visit: impl FnMu
             },
             false,
         ),
-        Tool::Trend | Tool::Ray => {
+        Tool::Trend | Tool::Ray | Tool::Measure => {
             if let Some(b) = b {
                 line(a, b, view.tool == Tool::Ray);
             }
@@ -469,6 +540,12 @@ fn rectangle_bounds(view: ShapeView<'_>, projection: Projection) -> Option<Recta
 }
 
 fn body_hit(view: ShapeView<'_>, style: Style, projection: Projection, point: Point) -> bool {
+    if view.tool == Tool::AnchoredVwap
+        && let Some(start) = view.vwap.and_then(crate::drawings::AnchoredVwap::start)
+        && distance_squared(point, projection.point(start)) <= PICK_RADIUS * PICK_RADIUS
+    {
+        return true;
+    }
     if view.tool == Tool::Rectangle
         && rectangle_bounds(view, projection).is_some_and(|r| r.contains(point))
     {
@@ -599,25 +676,54 @@ fn stroke_style(style: Style, color: Color) -> Stroke<'static> {
     }
 }
 
+pub struct NativeLabels<'a> {
+    pub price_scale: u32,
+    pub quote: &'a str,
+    pub candles: &'a [Candle],
+}
+
+pub fn native_anchor(projection: Projection, point: Point, candles: &[Candle]) -> Option<Anchor> {
+    let at = projection.anchor(point)?;
+    let next = candles.partition_point(|candle| candle.time.saturating_mul(1000) < at.utc_ms);
+    let before = next.checked_sub(1).and_then(|index| candles.get(index));
+    let after = candles.get(next);
+    let candle = match (before, after) {
+        (Some(a), Some(b)) => {
+            if at.utc_ms.abs_diff(a.time.saturating_mul(1000))
+                <= at.utc_ms.abs_diff(b.time.saturating_mul(1000))
+            {
+                a
+            } else {
+                b
+            }
+        }
+        (Some(candle), None) | (None, Some(candle)) => candle,
+        (None, None) => return None,
+    };
+    Some(Anchor {
+        utc_ms: candle.time.checked_mul(1000)?,
+        price: 0.0,
+    })
+}
+
 pub fn draw_committed(
     frame: &mut canvas::Frame,
     objects: &[Drawing],
     projection: Projection,
     palette: Palette,
-    price_scale: u32,
-    quote: &str,
+    labels: &NativeLabels<'_>,
     skip: Option<DrawingId>,
+    store: Option<&crate::drawings::Store>,
 ) {
     frame.with_clip(projection.area, |frame| {
         for drawing in objects.iter().filter(|d| d.visible && Some(d.id) != skip) {
             render(
                 frame,
-                ShapeView::drawing(drawing, drawing.shape.anchors()),
+                ShapeView::cached(drawing, drawing.shape.anchors(), store),
                 drawing.style,
                 projection,
                 palette,
-                price_scale,
-                quote,
+                labels,
             );
         }
     });
@@ -634,7 +740,14 @@ pub fn draw_overlay(
     palette: Palette,
     price_scale: u32,
     quote: &str,
+    native_candles: &[Candle],
+    store: Option<&crate::drawings::Store>,
 ) {
+    let labels = NativeLabels {
+        price_scale,
+        quote,
+        candles: native_candles,
+    };
     frame.with_clip(projection.area, |frame| {
         let edited = match &preview {
             Some(Preview::Edit { drawing, .. }) => Some(drawing.id),
@@ -645,7 +758,7 @@ pub fn draw_overlay(
         {
             selection(
                 frame,
-                ShapeView::drawing(drawing, drawing.shape.anchors()),
+                ShapeView::cached(drawing, drawing.shape.anchors(), store),
                 drawing.style,
                 projection,
                 palette,
@@ -659,7 +772,7 @@ pub fn draw_overlay(
         }) {
             selection(
                 frame,
-                ShapeView::drawing(drawing, drawing.shape.anchors()),
+                ShapeView::cached(drawing, drawing.shape.anchors(), store),
                 drawing.style,
                 projection,
                 palette,
@@ -669,28 +782,12 @@ pub fn draw_overlay(
         match preview {
             Some(Preview::Create { tool, anchors }) => {
                 let view = ShapeView::create(tool, anchors);
-                render(
-                    frame,
-                    view,
-                    Style::default(),
-                    projection,
-                    palette,
-                    price_scale,
-                    quote,
-                );
+                render(frame, view, Style::default(), projection, palette, &labels);
                 selection(frame, view, Style::default(), projection, palette, true);
             }
             Some(Preview::Edit { drawing, anchors }) if drawing.visible => {
-                let view = ShapeView::drawing(drawing, anchors);
-                render(
-                    frame,
-                    view,
-                    drawing.style,
-                    projection,
-                    palette,
-                    price_scale,
-                    quote,
-                );
+                let view = ShapeView::cached(drawing, anchors, store);
+                render(frame, view, drawing.style, projection, palette, &labels);
                 selection(frame, view, drawing.style, projection, palette, true);
             }
             _ => {}
@@ -766,9 +863,11 @@ fn render(
     style: Style,
     projection: Projection,
     palette: Palette,
-    price_scale: u32,
-    quote: &str,
+    labels: &NativeLabels<'_>,
 ) {
+    let price_scale = labels.price_scale;
+    let quote = labels.quote;
+    let native_candles = labels.candles;
     let color = ink(style, palette);
     if view.tool == Tool::Rectangle
         && let Some(bounds) = rectangle_bounds(view, projection)
@@ -804,7 +903,82 @@ fn render(
         }
         return;
     }
-    visit_lines(view, projection, |a, b| stroke(frame, a, b, style, color));
+    let mut visible_segment = None;
+    visit_lines(view, projection, |a, b| {
+        stroke(frame, a, b, style, color);
+        visible_segment = Some((a, b));
+    });
+    if view.tool == Tool::AnchoredVwap {
+        if visible_segment.is_none()
+            && let Some(start) = view.vwap.and_then(crate::drawings::AnchoredVwap::start)
+            && projection.contains(projection.point(start))
+        {
+            frame.fill(
+                &Path::circle(projection.point(start), line_width(style).max(2.0)),
+                color,
+            );
+        }
+        let label = view.vwap.map_or(
+            "Anchored VWAP · unavailable",
+            crate::drawings::AnchoredVwap::label,
+        );
+        let start = projection.point(view.anchors.first());
+        let at = visible_segment.map_or(
+            Point::new(
+                start.x.clamp(4.0, (projection.area.width - 160.0).max(4.0)),
+                16.0,
+            ),
+            |(_, last)| Point::new((last.x - 240.0).max(4.0), (last.y - 16.0).max(14.0)),
+        );
+        paint_text(frame, label, 11.0, at, color, projection.area);
+    }
+    if view.tool == Tool::Measure
+        && let Some((pa, pb)) = visible_segment
+        && let Some(b) = view.anchors.second()
+    {
+        let a = view.anchors.first();
+        let stats = measure_stats(a, b, native_candles);
+        let percent = if a.price == 0.0 {
+            "undefined".to_owned()
+        } else {
+            stats.percent.map_or_else(
+                || "out of range".to_owned(),
+                |value| format!("{value:+.2}%"),
+            )
+        };
+        let label = format!(
+            "Δ {} · {}\n{} · {} native bars{}",
+            price_label(stats.price_delta, price_scale, quote),
+            percent,
+            elapsed_label(stats.elapsed_ms),
+            stats.bars,
+            if stats.partial {
+                " · partial history"
+            } else {
+                ""
+            },
+        );
+        let midpoint = Point::new((pa.x + pb.x) * 0.5, (pa.y + pb.y) * 0.5);
+        with_text_layout(&label, 11.0, |layout| {
+            let at = Point::new(
+                (midpoint.x - layout.bounds.width * 0.5)
+                    .clamp(0.0, (projection.area.width - layout.bounds.width).max(0.0))
+                    - layout.bounds.x,
+                (midpoint.y - layout.bounds.height - 4.0).clamp(
+                    0.0,
+                    (projection.area.height - layout.bounds.height).max(0.0),
+                ) - layout.bounds.y,
+            );
+            paint_layout(
+                frame,
+                layout,
+                at,
+                palette.foreground,
+                projection.area,
+                Some(palette.background),
+            );
+        });
+    }
     if view.tool == Tool::Fibonacci {
         paint_fib_labels(frame, view, style, projection, palette, price_scale, quote);
     } else if view.tool == Tool::Horizontal {
@@ -830,6 +1004,53 @@ fn render(
                 );
             });
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeasureStats {
+    pub price_delta: f64,
+    pub percent: Option<f64>,
+    pub elapsed_ms: i64,
+    pub bars: usize,
+    pub partial: bool,
+}
+
+pub fn measure_stats(a: Anchor, b: Anchor, native_candles: &[Candle]) -> MeasureStats {
+    let (start, end) = (a.utc_ms.min(b.utc_ms), a.utc_ms.max(b.utc_ms));
+    let first = native_candles
+        .first()
+        .map(|candle| candle.time.saturating_mul(1000));
+    let last = native_candles
+        .last()
+        .map(|candle| candle.time.saturating_mul(1000));
+    let partial = first.is_none_or(|first| start < first) || last.is_none_or(|last| end > last);
+    let lower = native_candles.partition_point(|candle| candle.time.saturating_mul(1000) < start);
+    let upper = native_candles.partition_point(|candle| candle.time.saturating_mul(1000) <= end);
+    let delta = b.price - a.price;
+    let percent = (a.price != 0.0)
+        .then(|| delta / a.price * 100.0)
+        .filter(|value| value.is_finite());
+    MeasureStats {
+        price_delta: delta,
+        percent,
+        elapsed_ms: b.utc_ms.saturating_sub(a.utc_ms),
+        bars: upper.saturating_sub(lower),
+        partial,
+    }
+}
+
+fn elapsed_label(elapsed_ms: i64) -> String {
+    let total = elapsed_ms.unsigned_abs() / 1000;
+    let days = total / 86_400;
+    let hours = (total / 3_600) % 24;
+    let minutes = (total / 60) % 60;
+    let seconds = total % 60;
+    let sign = if elapsed_ms < 0 { "−" } else { "+" };
+    if days > 0 {
+        format!("{sign}{days}d {hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
     }
 }
 
@@ -929,13 +1150,24 @@ fn percent(ratio: f64) -> String {
 struct TextLayout {
     hash: u64,
     size: f32,
+    glyph_weight: usize,
     buffer: cosmic_text::Buffer,
     bounds: Rectangle,
     paths: Vec<Path>,
     pixels: Vec<(Point, Color)>,
 }
+
+// Budget shaped payload, not labels: short native-price labels must not churn
+// a small entry-count cache during a dense committed-scene rebuild.
+const CACHED_GLYPH_BUDGET: usize = 8_192;
+struct TextLayouts {
+    entries: VecDeque<TextLayout>,
+    glyphs: usize,
+}
 thread_local! {
-    static TEXT_LAYOUTS: RefCell<VecDeque<TextLayout>> = const { RefCell::new(VecDeque::new()) };
+    static TEXT_LAYOUTS: RefCell<TextLayouts> = const {
+        RefCell::new(TextLayouts { entries: VecDeque::new(), glyphs: 0 })
+    };
     static ACTIVE_TEXT_LAYOUT: RefCell<Option<TextLayout>> = const { RefCell::new(None) };
 }
 
@@ -962,6 +1194,7 @@ fn cached_text_bounds(text: &str, size: f32) -> Option<Rectangle> {
         TEXT_LAYOUTS.with(|cache| {
             cache
                 .borrow()
+                .entries
                 .iter()
                 .find(|layout| layout_matches(layout, text, size, hash))
                 .map(|layout| layout.bounds)
@@ -973,10 +1206,13 @@ fn take_text_layout(text: &str, size: f32, hash: u64) -> TextLayout {
     TEXT_LAYOUTS.with(|cache| {
         let mut cache = cache.borrow_mut();
         let index = cache
+            .entries
             .iter()
             .position(|entry| layout_matches(entry, text, size, hash));
         if let Some(index) = index {
-            cache.remove(index).expect("existing layout index")
+            let layout = cache.entries.remove(index).expect("existing layout index");
+            cache.glyphs -= layout.glyph_weight;
+            layout
         } else {
             make_text_layout(text, size, hash)
         }
@@ -984,12 +1220,17 @@ fn take_text_layout(text: &str, size: f32, hash: u64) -> TextLayout {
 }
 
 fn retain_text_layout(layout: TextLayout) {
+    if layout.glyph_weight > CACHED_GLYPH_BUDGET {
+        return;
+    }
     TEXT_LAYOUTS.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if cache.len() >= 64 {
-            cache.pop_front();
+        while cache.glyphs + layout.glyph_weight > CACHED_GLYPH_BUDGET {
+            let removed = cache.entries.pop_front().expect("nonempty weighted cache");
+            cache.glyphs -= removed.glyph_weight;
         }
-        cache.push_back(layout);
+        cache.glyphs += layout.glyph_weight;
+        cache.entries.push_back(layout);
     });
 }
 
@@ -1057,7 +1298,9 @@ fn make_text_layout(text: &str, size: f32, hash: u64) -> TextLayout {
     let mut cache = cosmic_text::SwashCache::new();
     let mut min = Point::ORIGIN;
     let mut max = Point::ORIGIN;
+    let mut glyphs = 0;
     for run in buffer.layout_runs() {
+        glyphs += run.glyphs.len();
         max.x = max.x.max(run.line_w);
         max.y = max.y.max(run.line_top + run.line_height);
         for glyph in run.glyphs {
@@ -1123,6 +1366,7 @@ fn make_text_layout(text: &str, size: f32, hash: u64) -> TextLayout {
     TextLayout {
         hash,
         size,
+        glyph_weight: glyphs.max(1),
         buffer,
         bounds: Rectangle::new(min, Size::new(max.x - min.x, max.y - min.y)),
         paths,
@@ -1195,6 +1439,143 @@ fn paint_layout(
 mod tests {
     use super::*;
 
+    #[test]
+    fn anchored_curve_remains_pickable_to_a_viewport_edge_between_native_candles() {
+        let mut store = crate::drawings::Store::new(&mexc_model::Market::default());
+        store
+            .apply(Command::Create {
+                shape: Shape::AnchoredVwap(Anchor {
+                    utc_ms: 0,
+                    price: 0.0,
+                }),
+                style: Style::default(),
+            })
+            .unwrap();
+        let id = store.selected().unwrap();
+        let candles = [(0, 10.0), (300, 30.0), (600, 50.0)].map(|(time, price)| Candle {
+            time,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: 1.0,
+            flow: None,
+        });
+        store.sync_vwap_preview(&candles, mexc_model::Timeframe::Min5, Some(0), None);
+        let projection = Projection::new(
+            Viewport {
+                left: 150.0,
+                span: 300.0,
+                low: 0.0,
+                high: 40.0,
+                auto_fit: false,
+                live: false,
+            },
+            Rectangle::new(Point::ORIGIN, Size::new(400.0, 200.0)),
+        )
+        .unwrap();
+        let point = projection.point(Anchor {
+            utc_ms: 449_000,
+            price: 20.0 + 149.0 / 300.0 * 10.0,
+        });
+        assert_eq!(
+            hit_test_cached(store.objects(), None, projection, point, Some(&store)),
+            Some(Hit {
+                id,
+                part: Part::Body
+            })
+        );
+    }
+
+    #[test]
+    fn anchored_curve_hit_testing_uses_derived_prices_and_does_not_bridge_native_gaps() {
+        let mut store = crate::drawings::Store::new(&mexc_model::Market::default());
+        store
+            .apply(Command::Create {
+                shape: Shape::AnchoredVwap(Anchor {
+                    utc_ms: 0,
+                    price: 999.0,
+                }),
+                style: Style::default(),
+            })
+            .unwrap();
+        let id = store.selected().unwrap();
+        let candles = [(0, 10.0), (300, 30.0), (900, 90.0)].map(|(time, price)| Candle {
+            time,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: 1.0,
+            flow: None,
+        });
+        store.sync_vwap_preview(&candles, mexc_model::Timeframe::Min5, Some(0), None);
+        let projection = Projection::new(
+            Viewport {
+                left: 0.0,
+                span: 1200.0,
+                low: 0.0,
+                high: 100.0,
+                auto_fit: false,
+                live: false,
+            },
+            Rectangle::new(Point::ORIGIN, Size::new(400.0, 200.0)),
+        )
+        .unwrap();
+        let point = |utc_ms, price| projection.point(Anchor { utc_ms, price });
+        let revision = store.vwap_revision();
+        assert_eq!(
+            hit_test_cached(
+                store.objects(),
+                None,
+                projection,
+                point(150_000, 15.0),
+                Some(&store)
+            ),
+            Some(Hit {
+                id,
+                part: Part::Body
+            })
+        );
+        assert!(
+            hit_test_cached(
+                store.objects(),
+                None,
+                projection,
+                point(600_000, 95.0 / 3.0),
+                Some(&store)
+            )
+            .is_none()
+        );
+        assert_eq!(
+            hit_test_cached(
+                store.objects(),
+                Some(id),
+                projection,
+                point(0, 10.0),
+                Some(&store)
+            ),
+            Some(Hit {
+                id,
+                part: Part::First
+            })
+        );
+        assert_eq!(store.vwap_revision(), revision);
+        store
+            .apply(Command::SetVisible { id, visible: false })
+            .unwrap();
+        assert!(
+            hit_test_cached(
+                store.objects(),
+                Some(id),
+                projection,
+                point(150_000, 15.0),
+                Some(&store)
+            )
+            .is_none()
+        );
+    }
+
     fn projection() -> Projection {
         Projection::new(
             Viewport {
@@ -1227,6 +1608,49 @@ mod tests {
         assert!((a - b).abs() < 0.01, "{a} != {b}");
     }
 
+    #[test]
+    fn measure_counts_sparse_native_bars_and_preserves_reversed_signed_metrics() {
+        let candles = [
+            Candle {
+                time: 1,
+                open: 0.0,
+                high: 1.0,
+                low: 0.0,
+                close: 0.0,
+                volume: 0.0,
+                flow: None,
+            },
+            Candle {
+                time: 3,
+                open: 0.0,
+                high: 1.0,
+                low: 0.0,
+                close: 0.0,
+                volume: 0.0,
+                flow: None,
+            },
+            Candle {
+                time: 5,
+                open: 0.0,
+                high: 1.0,
+                low: 0.0,
+                close: 0.0,
+                volume: 0.0,
+                flow: None,
+            },
+        ];
+        let stats = measure_stats(anchor(5, 0.0), anchor(1, 3.0), &candles);
+        assert_eq!(stats.price_delta, 3.0);
+        assert_eq!(stats.percent, None);
+        assert_eq!(stats.elapsed_ms, -4_000);
+        assert_eq!(stats.bars, 3);
+        assert!(!stats.partial);
+
+        let outside = measure_stats(anchor(0, 1.0), anchor(6, 2.0), &candles);
+        assert_eq!(outside.bars, 3);
+        assert!(outside.partial);
+        assert_eq!(outside.percent, Some(100.0));
+    }
     #[test]
     fn transforms_native_prices_milliseconds_and_captured_outside_drag() {
         let projection = projection();

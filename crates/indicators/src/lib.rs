@@ -9,10 +9,21 @@ use std::fmt;
 
 use mexc_model::{Candle, FlowQuality, Timeframe};
 
+pub mod profiles;
+
 mod sources;
 pub use sources::{
-    ContributorStatus, ExternalIndicatorOutput, IndicatorSource, SourceData, SourceMode,
+    ContributorStatus, ExternalIndicatorOutput, IndicatorSource, SourceCondition, SourceData,
+    SourceDiagnostics, SourceMode,
 };
+
+mod vwap;
+pub use vwap::{VwapContext, VwapReset, VwapState};
+
+/// Validate source configuration independently of catalog availability.
+pub fn validate_source(source: &IndicatorSource, spec: IndicatorSpec) -> Result<(), String> {
+    source.validate(spec)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CvdReset {
@@ -58,10 +69,11 @@ pub enum IndicatorKind {
     Stochastic,
     Cvd,
     OpenInterest,
+    Vwap,
 }
 
 impl IndicatorKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Sma,
         Self::Ema,
         Self::Bollinger,
@@ -71,6 +83,7 @@ impl IndicatorKind {
         Self::Stochastic,
         Self::Cvd,
         Self::OpenInterest,
+        Self::Vwap,
     ];
 
     pub fn name(self) -> &'static str {
@@ -84,6 +97,7 @@ impl IndicatorKind {
             Self::Stochastic => "Stochastic",
             Self::Cvd => "CVD",
             Self::OpenInterest => "Open Interest",
+            Self::Vwap => "VWAP",
         }
     }
 
@@ -111,6 +125,9 @@ impl IndicatorKind {
                 reset: CvdReset::Continuous,
             },
             Self::OpenInterest => IndicatorSpec::OpenInterest,
+            Self::Vwap => IndicatorSpec::Vwap {
+                reset: profiles::Period::Day,
+            },
         }
     }
 }
@@ -153,6 +170,9 @@ pub enum IndicatorSpec {
         reset: CvdReset,
     },
     OpenInterest,
+    Vwap {
+        reset: profiles::Period,
+    },
 }
 
 impl IndicatorSpec {
@@ -167,6 +187,7 @@ impl IndicatorSpec {
             Self::Stochastic { .. } => IndicatorKind::Stochastic,
             Self::Cvd { .. } => IndicatorKind::Cvd,
             Self::OpenInterest => IndicatorKind::OpenInterest,
+            Self::Vwap { .. } => IndicatorKind::Vwap,
         }
     }
 
@@ -212,13 +233,14 @@ impl IndicatorSpec {
                 period("D smoothing", smooth_d)
             }
             Self::Cvd { .. } | Self::OpenInterest => Ok(()),
+            Self::Vwap { reset } => VwapReset::Session(reset).validate(),
         }
     }
 
     pub fn is_overlay(self) -> bool {
         matches!(
             self,
-            Self::Sma { .. } | Self::Ema { .. } | Self::Bollinger { .. }
+            Self::Sma { .. } | Self::Ema { .. } | Self::Bollinger { .. } | Self::Vwap { .. }
         )
     }
 
@@ -237,6 +259,7 @@ impl IndicatorSpec {
             } => format!("Stochastic({period}, {smooth_k}, {smooth_d})"),
             Self::Cvd { reset } => format!("CVD ({reset})"),
             Self::OpenInterest => "Open Interest (native)".into(),
+            Self::Vwap { reset } => format!("VWAP ({})", VwapReset::Session(reset)),
         }
     }
 
@@ -251,6 +274,7 @@ impl IndicatorSpec {
             Self::Stochastic { .. } => &["%K", "%D"],
             Self::Cvd { .. } => &["CVD"],
             Self::OpenInterest => &["OI"],
+            Self::Vwap { .. } => &["VWAP"],
         }
     }
 }
@@ -274,6 +298,7 @@ enum History {
         lows: VecDeque<usize>,
     },
     Cvd(Vec<CvdCheckpoint>),
+    Vwap(VwapState),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -298,6 +323,7 @@ impl History {
                 lows: VecDeque::with_capacity(period),
             },
             IndicatorSpec::Cvd { .. } => Self::Cvd(Vec::new()),
+            IndicatorSpec::Vwap { .. } => Self::Vwap(VwapState::default()),
             _ => Self::OutputsOnly,
         }
     }
@@ -324,6 +350,41 @@ pub struct IndicatorSet {
 }
 
 impl IndicatorSet {
+    /// Recreate committed configuration without candles, values, or source caches.
+    /// Native availability is checked by the caller after catalogs arrive.
+    pub fn restore_instance(
+        &mut self,
+        id: u64,
+        spec: IndicatorSpec,
+        source: IndicatorSource,
+        visible: bool,
+    ) -> Result<(), String> {
+        if id == 0 || id == u64::MAX {
+            return Err("Indicator ID must be nonzero and leave room for the next ID".into());
+        }
+        if self.instances.iter().any(|instance| instance.id == id) {
+            return Err(format!("Duplicate indicator #{id}"));
+        }
+        spec.validate()?;
+        source.validate(spec)?;
+        let mut instance = IndicatorInstance {
+            id,
+            spec,
+            visible,
+            points: Vec::new(),
+            source,
+            external: None,
+            all_source_error: None,
+            all_source_revision: 0,
+            source_cache: sources::SourceCache::default(),
+            history: History::new(spec),
+        };
+        instance.reset_all_source_validation();
+        self.instances.push(instance);
+        self.last_id = self.last_id.max(id);
+        Ok(())
+    }
+
     pub fn add(
         &mut self,
         spec: IndicatorSpec,
@@ -334,6 +395,7 @@ impl IndicatorSet {
         let id = self
             .last_id
             .checked_add(1)
+            .filter(|id| *id != u64::MAX)
             .ok_or("Indicator IDs exhausted")?;
         let mut instance = IndicatorInstance {
             id,
@@ -550,7 +612,21 @@ impl IndicatorInstance {
                 timeframe,
                 *reset,
             ),
+            (IndicatorSpec::Vwap { reset }, History::Vwap(state)) => state.update(
+                candles,
+                &mut self.points,
+                from,
+                timeframe,
+                VwapReset::Session(*reset),
+            ),
             _ => unreachable!("Indicator configuration and its private history must agree"),
+        }
+    }
+
+    pub fn vwap_context(&self, index: usize) -> Option<VwapContext> {
+        match &self.history {
+            History::Vwap(state) => state.context(index),
+            _ => None,
         }
     }
 

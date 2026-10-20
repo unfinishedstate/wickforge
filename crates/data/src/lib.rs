@@ -1,3 +1,4 @@
+mod executions;
 mod open_interest;
 mod providers;
 
@@ -110,6 +111,25 @@ impl DataService {
         }
     }
 
+    /// Explicit retry bypasses only a completed failed discovery in this exact scope.
+    /// Successful catalogs and shared in-flight discovery remain reusable.
+    pub async fn retry_catalog(
+        &self,
+        exchange: Exchange,
+        product: Product,
+    ) -> Result<Arc<Catalog>> {
+        self.invalidate_failed_catalog(exchange, product).await;
+        self.catalog(exchange, product).await
+    }
+
+    async fn invalidate_failed_catalog(&self, exchange: Exchange, product: Product) {
+        let index = exchange.index() * Product::ALL.len() + product.index();
+        let mut cell = self.state.catalogs[index].lock().await;
+        if cell.get().is_some_and(|cached| cached.result.is_err()) {
+            *cell = Arc::new(OnceCell::new());
+        }
+    }
+
     async fn validate_market(&self, market: &Market) -> Result<(Arc<Catalog>, usize)> {
         let (catalog, index) = self.validate_instrument(market).await?;
         ensure!(
@@ -135,6 +155,56 @@ impl DataService {
                 )
             })?;
         Ok((catalog, index))
+    }
+
+    /// Priced native executions, independent of the displayed candle interval.
+    /// Missing replay and unproved source continuity are reported in coverage.
+    pub async fn execution_history(
+        &self,
+        market: &Market,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<mexc_model::executions::ExecutionPage> {
+        ensure!(
+            start_ms >= 0 && end_ms > start_ms,
+            "invalid execution history range"
+        );
+        let (catalog, index) = self.validate_instrument(market).await?;
+        providers::execution_history(
+            &self.state.flow_http,
+            &catalog.instruments[index],
+            start_ms,
+            end_ms,
+        )
+        .await
+    }
+
+    /// One shared native tape per venue/product/symbol. Dropping this future or
+    /// closing the receiver cancels its owned connection, including reconnects.
+    pub async fn execution_stream(
+        &self,
+        market: Market,
+        sender: mpsc::Sender<mexc_model::executions::ExecutionEvent>,
+        shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        if *shutdown.borrow() || sender.is_closed() {
+            return Ok(());
+        }
+        let operation = async {
+            let (catalog, index) = self.validate_instrument(&market).await?;
+            executions::stream(
+                &self.state.flow_http,
+                &catalog.instruments[index],
+                sender.clone(),
+                shutdown.clone(),
+            )
+            .await
+        };
+        tokio::select! {
+            _ = executions::cancelled(shutdown.clone()) => Ok(()),
+            _ = sender.closed() => Ok(()),
+            result = operation => result,
+        }
     }
 
     pub async fn history(&self, market: &Market, before: Option<i64>) -> Result<HistoryPage> {
@@ -596,6 +666,7 @@ mod tests {
             quote_coin: mexc_model::Quote::USDC,
             settle_coin: "USDC".into(),
             price_scale: 1,
+            tick_size: None,
             contract_size: 1.0,
             inverse: false,
             volume_unit: "native positions".into(),
@@ -626,6 +697,19 @@ mod tests {
         assert!(page.support.live_interval_ms.is_none());
         assert!(service.history_in_base(&market, None).await.is_err());
         assert!(service.open_interest_history(&market, None).await.is_err());
+        let executions = service
+            .execution_history(&market, 1000, 2000)
+            .await
+            .unwrap();
+        assert!(executions.executions.is_empty());
+        assert!(!executions.coverage.is_empty());
+        assert!(executions.coverage.iter().all(|range| !range.complete));
+        assert!(
+            service
+                .execution_history(&market, 2000, 1000)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -642,6 +726,13 @@ mod tests {
         let (sender, mut events) = mpsc::channel(1);
         service
             .open_interest_stream_in_base(Market::default(), sender, receiver)
+            .await
+            .unwrap();
+        assert!(events.recv().await.is_none());
+        let (_shutdown, receiver) = watch::channel(true);
+        let (sender, mut events) = mpsc::channel(1);
+        service
+            .execution_stream(Market::default(), sender, receiver)
             .await
             .unwrap();
         assert!(events.recv().await.is_none());
@@ -795,6 +886,104 @@ mod tests {
         };
         assert_eq!(message, format!("{error:#}"));
         assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_discovery_retry_only_replaces_completed_failed_exact_scope() {
+        let service = DataService::new().unwrap();
+        let exchange = Exchange::Binance;
+        let product = Product::Perpetual;
+        let failed_index = exchange.index() * Product::ALL.len() + product.index();
+        let failed = Arc::clone(&*service.state.catalogs[failed_index].lock().await);
+        failed
+            .set(CachedCatalog {
+                loaded: Instant::now(),
+                result: Err(Arc::new(anyhow::anyhow!("completed discovery failure"))),
+            })
+            .unwrap_or_else(|_| panic!("cache starts empty"));
+        let unrelated_index = Exchange::Okx.index() * Product::ALL.len() + Product::Spot.index();
+        let unrelated = Arc::clone(&*service.state.catalogs[unrelated_index].lock().await);
+        tokio::join!(
+            service.invalidate_failed_catalog(exchange, product),
+            service.invalidate_failed_catalog(exchange, product),
+        );
+        let fresh = Arc::clone(&*service.state.catalogs[failed_index].lock().await);
+        assert!(!Arc::ptr_eq(&fresh, &failed));
+        assert!(fresh.get().is_none());
+        service.invalidate_failed_catalog(exchange, product).await;
+        assert!(Arc::ptr_eq(
+            &fresh,
+            &*service.state.catalogs[failed_index].lock().await
+        ));
+        assert!(Arc::ptr_eq(
+            &unrelated,
+            &*service.state.catalogs[unrelated_index].lock().await
+        ));
+        let catalog = Arc::new(Catalog {
+            exchange,
+            product,
+            intervals: Vec::new(),
+            instruments: Vec::new(),
+            flow_support: providers::flow_support(exchange, product),
+        });
+        fresh
+            .set(CachedCatalog {
+                loaded: Instant::now(),
+                result: Ok(Arc::clone(&catalog)),
+            })
+            .unwrap_or_else(|_| panic!("retry cell starts empty"));
+        let result = service.retry_catalog(exchange, product).await.unwrap();
+        assert!(Arc::ptr_eq(&catalog, &result));
+        assert!(Arc::ptr_eq(
+            &fresh,
+            &*service.state.catalogs[failed_index].lock().await
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_discovery_retry_does_not_split_a_shared_in_flight_scope() {
+        let service = DataService::new().unwrap();
+        let exchange = Exchange::Okx;
+        let product = Product::Perpetual;
+        let index = exchange.index() * Product::ALL.len() + product.index();
+        let cell = Arc::clone(&*service.state.catalogs[index].lock().await);
+        let initializing = Arc::clone(&cell);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (finish, completed) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            initializing
+                .get_or_init(|| async {
+                    let _ = started.send(());
+                    let _ = completed.await;
+                    CachedCatalog {
+                        loaded: Instant::now(),
+                        result: Ok(Arc::new(Catalog {
+                            exchange,
+                            product,
+                            intervals: Vec::new(),
+                            instruments: Vec::new(),
+                            flow_support: providers::flow_support(exchange, product),
+                        })),
+                    }
+                })
+                .await;
+        });
+        ready.await.unwrap();
+        tokio::join!(
+            service.invalidate_failed_catalog(exchange, product),
+            service.invalidate_failed_catalog(exchange, product),
+        );
+        assert!(Arc::ptr_eq(
+            &cell,
+            &*service.state.catalogs[index].lock().await
+        ));
+        finish.send(()).unwrap();
+        task.await.unwrap();
+        let expected = cell.get().unwrap().result.as_ref().unwrap();
+        assert!(Arc::ptr_eq(
+            expected,
+            &service.retry_catalog(exchange, product).await.unwrap()
+        ));
     }
 
     #[tokio::test]
